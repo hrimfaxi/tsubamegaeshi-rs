@@ -25,6 +25,84 @@ use base64::Engine;
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_AAAA: u16 = 28;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AddressQueryKind {
+    A,
+    Aaaa,
+}
+
+impl AddressQueryKind {
+    fn cache_qtype(self) -> u16 {
+        match self {
+            AddressQueryKind::A => DNS_TYPE_A,
+            AddressQueryKind::Aaaa => DNS_TYPE_AAAA,
+        }
+    }
+
+    fn cache_hit_tag(self) -> &'static str {
+        match self {
+            AddressQueryKind::A => "CACHE-HIT",
+            AddressQueryKind::Aaaa => "CACHE-HIT-AAAA",
+        }
+    }
+
+    fn cache_skip_tag(self) -> &'static str {
+        match self {
+            AddressQueryKind::A => "CACHE-SKIP",
+            AddressQueryKind::Aaaa => "CACHE-SKIP-AAAA",
+        }
+    }
+
+    fn special_tag(self) -> &'static str {
+        match self {
+            AddressQueryKind::A => "SPECIAL",
+            AddressQueryKind::Aaaa => "SPECIAL-AAAA",
+        }
+    }
+
+    fn force_domestic_tag(self) -> &'static str {
+        match self {
+            AddressQueryKind::A => "FORCE-DOMESTIC",
+            AddressQueryKind::Aaaa => "FORCE-DOMESTIC-AAAA",
+        }
+    }
+
+    fn force_foreign_tag(self) -> &'static str {
+        match self {
+            AddressQueryKind::A => "FORCE-FOREIGN",
+            AddressQueryKind::Aaaa => "FORCE-FOREIGN-AAAA",
+        }
+    }
+
+    fn gfwlist_tag(self) -> &'static str {
+        match self {
+            AddressQueryKind::A => "GFWLIST",
+            AddressQueryKind::Aaaa => "GFWLIST-AAAA",
+        }
+    }
+
+    fn domestic_tag(self) -> &'static str {
+        match self {
+            AddressQueryKind::A => "DOMESTIC",
+            AddressQueryKind::Aaaa => "DOMESTIC-AAAA",
+        }
+    }
+
+    fn foreign_tag(self) -> &'static str {
+        match self {
+            AddressQueryKind::A => "FOREIGN",
+            AddressQueryKind::Aaaa => "FOREIGN-AAAA",
+        }
+    }
+
+    fn foreign_timeout_tag(self) -> &'static str {
+        match self {
+            AddressQueryKind::A => "FOREIGN-TIMEOUT",
+            AddressQueryKind::Aaaa => "FOREIGN-TIMEOUT-AAAA",
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "tsubamegaeshi-rs", about = "燕返 - Lightweight DNS splitter")]
 struct Cli {
@@ -288,6 +366,332 @@ fn is_ipv6_polluted(ip: &std::net::Ipv6Addr) -> bool {
 }
 
 impl DnsServer {
+    async fn handle_hosts_override(
+        &self,
+        kind: AddressQueryKind,
+        query_msg: &Message,
+        clean_domain: &str,
+        src: SocketAddr,
+    ) -> bool {
+        let Some(hosts) = &self.hosts else {
+            return false;
+        };
+
+        match kind {
+            AddressQueryKind::A => {
+                let Some(ip_str) = hosts.get(clean_domain) else {
+                    return false;
+                };
+
+                let Ok(ip) = Ipv4Addr::from_str(ip_str) else {
+                    return false;
+                };
+
+                let resp_bytes = build_a_response(query_msg, ip, 60);
+
+                info!("[HOSTS] {} -> {}", clean_domain, ip);
+
+                let _ = self.socket.send_to(&resp_bytes, src).await;
+                true
+            }
+
+            AddressQueryKind::Aaaa => {
+                if !hosts.contains_key(clean_domain) {
+                    return false;
+                }
+
+                info!(
+                    "[HOSTS-NO-AAAA] {} in hosts, returning NODATA",
+                    clean_domain
+                );
+
+                let nodata = build_nodata_response(query_msg);
+                let _ = self.socket.send_to(&nodata, src).await;
+                true
+            }
+        }
+    }
+
+    async fn forward_by_static_rules(
+        &self,
+        kind: AddressQueryKind,
+        request: &[u8],
+        query_msg: &Message,
+        clean_domain: &str,
+        src: SocketAddr,
+    ) -> bool {
+        // 特殊后缀检查：直接走 special_upstream
+        for suffix in &self.special_suffixes {
+            if domain_matches_suffix(clean_domain, suffix) {
+                info!("[{}] {} -> dnsmasq", kind.special_tag(), clean_domain);
+
+                let _ = self
+                    .forward_to_upstream(request, query_msg, &self.special_upstream, &src)
+                    .await;
+
+                return true;
+            }
+        }
+
+        // 强制走国内上游
+        if is_forced(clean_domain, &self.force_domestic) {
+            info!(
+                "[{}] {} -> {}",
+                kind.force_domestic_tag(),
+                clean_domain,
+                self.domestic_upstream
+            );
+
+            let _ = self
+                .forward_to_upstream(request, query_msg, &self.domestic_upstream, &src)
+                .await;
+
+            return true;
+        }
+
+        // 强制走国外上游
+        if is_forced(clean_domain, &self.force_foreign) {
+            info!(
+                "[{}] {} -> {}",
+                kind.force_foreign_tag(),
+                clean_domain,
+                self.foreign_upstream
+            );
+
+            let _ = self
+                .forward_to_upstream(request, query_msg, &self.foreign_upstream, &src)
+                .await;
+
+            return true;
+        }
+
+        // GFWList 检查：命中则直接走 foreign_upstream
+        if let Some(ref gfw) = self.gfw_checker {
+            if gfw.check(clean_domain) {
+                info!(
+                    "[{}] {} in gfwlist, direct to foreign",
+                    kind.gfwlist_tag(),
+                    clean_domain
+                );
+
+                let _ = self
+                    .forward_to_upstream(request, query_msg, &self.foreign_upstream, &src)
+                    .await;
+
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn should_use_domestic_a_response(
+        &self,
+        clean_domain: &str,
+        domestic_resp: &Option<Vec<u8>>,
+    ) -> bool {
+        match domestic_resp {
+            Some(resp_bytes) => match Message::from_vec(resp_bytes) {
+                Ok(msg) => {
+                    match msg.answers().iter().find_map(|rr| {
+                        if rr.record_type() == RecordType::A {
+                            rr.data().and_then(|d| d.ip_addr())
+                        } else {
+                            None
+                        }
+                    }) {
+                        Some(ip) => {
+                            let is_cn = self.is_china_ip(ip);
+
+                            if is_cn {
+                                info!("[DOMESTIC-KEEP] {} ({} - China)", clean_domain, ip);
+                                true
+                            } else {
+                                info!(
+                                    "[DOMESTIC-REJECT] {} ({} - not China) -> foreign",
+                                    clean_domain, ip
+                                );
+
+                                false
+                            }
+                        }
+                        None => {
+                            info!("[DOMESTIC-NO-IP] {} -> foreign", clean_domain);
+                            false
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to parse domestic response for {}: {}",
+                        clean_domain, e
+                    );
+
+                    false
+                }
+            },
+            None => {
+                info!("[DOMESTIC-TIMEOUT] {} -> foreign", clean_domain);
+                false
+            }
+        }
+    }
+
+    fn should_use_domestic_aaaa_response(
+        &self,
+        clean_domain: &str,
+        domestic_resp: &Option<Vec<u8>>,
+    ) -> bool {
+        match domestic_resp {
+            Some(data) => {
+                if let Ok(msg) = Message::from_vec(data) {
+                    let first_ipv6 = msg.answers().iter().find_map(|rr| {
+                        if rr.record_type() == RecordType::AAAA {
+                            rr.data().and_then(|d| d.ip_addr())
+                        } else {
+                            None
+                        }
+                    });
+
+                    match first_ipv6 {
+                        Some(IpAddr::V6(ipv6)) => {
+                            if is_ipv6_polluted(&ipv6) {
+                                info!(
+                                    "[DOMESTIC-POLLUTED-AAAA] {} ({}) -> foreign",
+                                    clean_domain, ipv6
+                                );
+
+                                false
+                            } else {
+                                info!("[DOMESTIC-KEEP-AAAA] {} ({})", clean_domain, ipv6);
+                                true
+                            }
+                        }
+                        Some(_) => {
+                            // 理论上 AAAA 查询不应返回非 IPv6 地址，这里保守使用国内结果
+                            true
+                        }
+                        None => {
+                            info!("[DOMESTIC-NO-IP-AAAA] {} -> foreign", clean_domain);
+                            false
+                        }
+                    }
+                } else {
+                    info!("[DOMESTIC-PARSE-ERR-AAAA] {} -> foreign", clean_domain);
+                    false
+                }
+            }
+            None => {
+                info!("[DOMESTIC-TIMEOUT-AAAA] {} -> foreign", clean_domain);
+                false
+            }
+        }
+    }
+
+    fn should_use_domestic_response(
+        &self,
+        kind: AddressQueryKind,
+        clean_domain: &str,
+        domestic_resp: &Option<Vec<u8>>,
+    ) -> bool {
+        match kind {
+            AddressQueryKind::A => self.should_use_domestic_a_response(clean_domain, domestic_resp),
+            AddressQueryKind::Aaaa => {
+                self.should_use_domestic_aaaa_response(clean_domain, domestic_resp)
+            }
+        }
+    }
+
+    async fn handle_address_request(
+        &self,
+        kind: AddressQueryKind,
+        request: &[u8],
+        query_msg: &Message,
+        clean_domain: &str,
+        src: SocketAddr,
+    ) {
+        // hosts 处理：
+        // - A：返回 hosts 里的 IPv4
+        // - AAAA：如果 hosts 里存在该域名，则返回 NODATA
+        if self
+            .handle_hosts_override(kind, query_msg, clean_domain, src)
+            .await
+        {
+            return;
+        }
+
+        // 如果禁用了 AAAA，则不查缓存、不查上游，直接返回 NODATA
+        if kind == AddressQueryKind::Aaaa && !self.enable_ipv6_aaaa {
+            let nodata = build_nodata_response(query_msg);
+            let _ = self.socket.send_to(&nodata, src).await;
+            return;
+        }
+
+        // 缓存检查
+        if self
+            .send_cached_response(
+                clean_domain,
+                kind.cache_qtype(),
+                query_msg.id(),
+                src,
+                kind.cache_hit_tag(),
+            )
+            .await
+        {
+            return;
+        }
+
+        // special suffix / force domestic / force foreign / gfwlist
+        if self
+            .forward_by_static_rules(kind, request, query_msg, clean_domain, src)
+            .await
+        {
+            return;
+        }
+
+        // 普通域名：先查国内，根据 A/AAAA 各自规则判断是否使用国内结果
+        info!(
+            "[{}] {} -> {}",
+            kind.domestic_tag(),
+            clean_domain,
+            self.domestic_upstream
+        );
+
+        let domestic_resp = self.send_dns_query(request, &self.domestic_upstream).await;
+
+        let use_domestic = self.should_use_domestic_response(kind, clean_domain, &domestic_resp);
+
+        let final_resp = if use_domestic {
+            domestic_resp.unwrap()
+        } else {
+            info!(
+                "[{}] {} -> {}",
+                kind.foreign_tag(),
+                clean_domain,
+                self.foreign_upstream
+            );
+
+            self.query_upstream_or_servfail(
+                request,
+                query_msg,
+                &self.foreign_upstream,
+                Some((kind.foreign_timeout_tag(), clean_domain)),
+            )
+            .await
+        };
+
+        // 只缓存 NOERROR 且有答案，TTL 为 0 不缓存
+        self.cache_response(
+            clean_domain,
+            kind.cache_qtype(),
+            &final_resp,
+            kind.cache_skip_tag(),
+        )
+        .await;
+
+        let _ = self.socket.send_to(&final_resp, src).await;
+    }
+
     async fn send_cached_response(
         &self,
         domain: &str,
@@ -425,343 +829,44 @@ impl DnsServer {
             return;
         }
 
-        let qtype = query_msg.queries()[0].query_type();
-        let raw_domain = query_msg.queries()[0].name().to_utf8().to_string();
+        let query = &query_msg.queries()[0];
+        let qtype = query.query_type();
+        let raw_domain = query.name().to_utf8().to_string();
         let clean_domain = raw_domain.trim_end_matches('.').to_string();
 
-        // 处理 AAAA 查询
-        if qtype == RecordType::AAAA {
-            // 如果域名存在 hosts 记录，但 hosts 中没有 IPv6 地址，
-            // 则直接返回 NODATA，避免去上游查询导致超时（尤其是上游不可用时）
-            if let Some(hosts) = &self.hosts {
-                if hosts.contains_key(&clean_domain) {
-                    info!(
-                        "[HOSTS-NO-AAAA] {} in hosts, returning NODATA",
-                        clean_domain
-                    );
-
-                    let nodata = build_nodata_response(&query_msg);
-                    let _ = self.socket.send_to(&nodata, src).await;
-                    return;
-                }
-            }
-
-            // 如果禁用了 AAAA，则不查缓存、不查上游，直接返回 NODATA
-            if !self.enable_ipv6_aaaa {
-                let nodata = build_nodata_response(&query_msg);
-                let _ = self.socket.send_to(&nodata, src).await;
-                return;
-            }
-
-            // AAAA 缓存检查
-            if self
-                .send_cached_response(
+        match qtype {
+            RecordType::A => {
+                self.handle_address_request(
+                    AddressQueryKind::A,
+                    &request,
+                    &query_msg,
                     &clean_domain,
-                    DNS_TYPE_AAAA,
-                    query_msg.id(),
                     src,
-                    "CACHE-HIT-AAAA",
                 )
-                .await
-            {
-                return;
+                .await;
             }
 
-            // 特殊后缀检查：直接走 special_upstream
-            for suffix in &self.special_suffixes {
-                if domain_matches_suffix(&clean_domain, suffix) {
-                    info!("[SPECIAL-AAAA] {} -> dnsmasq", clean_domain);
-
-                    let _ = self
-                        .forward_to_upstream(&request, &query_msg, &self.special_upstream, &src)
-                        .await;
-
-                    return;
-                }
+            RecordType::AAAA => {
+                self.handle_address_request(
+                    AddressQueryKind::Aaaa,
+                    &request,
+                    &query_msg,
+                    &clean_domain,
+                    src,
+                )
+                .await;
             }
 
-            // 强制国内 AAAA
-            if is_forced(&clean_domain, &self.force_domestic) {
-                info!(
-                    "[FORCE-DOMESTIC-AAAA] {} -> {}",
-                    clean_domain, self.domestic_upstream
-                );
+            _ => {
+                // 非 A / AAAA 查询直接给国内上游
+                tracing::debug!("[NON-A] {} type={:?} -> domestic", clean_domain, qtype);
 
                 let _ = self
                     .forward_to_upstream(&request, &query_msg, &self.domestic_upstream, &src)
                     .await;
-
-                return;
-            }
-
-            // 强制国外 AAAA
-            if is_forced(&clean_domain, &self.force_foreign) {
-                info!(
-                    "[FORCE-FOREIGN-AAAA] {} -> {}",
-                    clean_domain, self.foreign_upstream
-                );
-
-                let _ = self
-                    .forward_to_upstream(&request, &query_msg, &self.foreign_upstream, &src)
-                    .await;
-
-                return;
-            }
-
-            // GFWList 检查：命中则直接走 foreign_upstream
-            if let Some(ref gfw) = self.gfw_checker {
-                if gfw.check(&clean_domain) {
-                    info!(
-                        "[GFWLIST-AAAA] {} in gfwlist, direct to foreign",
-                        clean_domain
-                    );
-
-                    let _ = self
-                        .forward_to_upstream(&request, &query_msg, &self.foreign_upstream, &src)
-                        .await;
-
-                    return;
-                }
-            }
-
-            // 普通 AAAA 域名：先查国内，根据返回的 IPv6 判断是否使用国内结果
-            info!(
-                "[DOMESTIC-AAAA] {} -> {}",
-                clean_domain, self.domestic_upstream
-            );
-
-            let domestic_resp = self.send_dns_query(&request, &self.domestic_upstream).await;
-
-            let use_domestic = match &domestic_resp {
-                Some(data) => {
-                    if let Ok(msg) = Message::from_vec(data) {
-                        let first_ipv6 = msg.answers().iter().find_map(|rr| {
-                            if rr.record_type() == RecordType::AAAA {
-                                rr.data().and_then(|d| d.ip_addr())
-                            } else {
-                                None
-                            }
-                        });
-
-                        match first_ipv6 {
-                            Some(IpAddr::V6(ipv6)) => {
-                                if is_ipv6_polluted(&ipv6) {
-                                    info!(
-                                        "[DOMESTIC-POLLUTED-AAAA] {} ({}) -> foreign",
-                                        clean_domain, ipv6
-                                    );
-
-                                    false
-                                } else {
-                                    info!("[DOMESTIC-KEEP-AAAA] {} ({})", clean_domain, ipv6);
-                                    true
-                                }
-                            }
-                            Some(_) => {
-                                // 理论上 AAAA 查询不应返回非 IPv6 地址，这里保守使用国内结果
-                                true
-                            }
-                            None => {
-                                info!("[DOMESTIC-NO-IP-AAAA] {} -> foreign", clean_domain);
-                                false
-                            }
-                        }
-                    } else {
-                        info!("[DOMESTIC-PARSE-ERR-AAAA] {} -> foreign", clean_domain);
-                        false
-                    }
-                }
-                None => {
-                    info!("[DOMESTIC-TIMEOUT-AAAA] {} -> foreign", clean_domain);
-                    false
-                }
-            };
-
-            let final_resp = if use_domestic {
-                domestic_resp.unwrap()
-            } else {
-                info!(
-                    "[FOREIGN-AAAA] {} -> {}",
-                    clean_domain, self.foreign_upstream
-                );
-
-                self.query_upstream_or_servfail(
-                    &request,
-                    &query_msg,
-                    &self.foreign_upstream,
-                    Some(("FOREIGN-TIMEOUT-AAAA", &clean_domain)),
-                )
-                .await
-            };
-
-            // 缓存 AAAA 响应：只缓存 NOERROR 且有答案，TTL 为 0 不缓存
-            self.cache_response(&clean_domain, DNS_TYPE_AAAA, &final_resp, "CACHE-SKIP-AAAA")
-                .await;
-
-            let _ = self.socket.send_to(&final_resp, src).await;
-            return;
-        }
-
-        // 非 A 查询直接给国内上游
-        if qtype != RecordType::A {
-            tracing::debug!("[NON-A] {} type={:?} -> domestic", clean_domain, qtype);
-
-            let _ = self
-                .forward_to_upstream(&request, &query_msg, &self.domestic_upstream, &src)
-                .await;
-
-            return;
-        }
-
-        // hosts 静态 A 记录
-        if let Some(hosts) = &self.hosts {
-            if let Some(ip_str) = hosts.get(&clean_domain) {
-                if let Ok(ip) = Ipv4Addr::from_str(ip_str) {
-                    let resp_bytes = build_a_response(&query_msg, ip, 60);
-
-                    info!("[HOSTS] {} -> {}", clean_domain, ip);
-
-                    let _ = self.socket.send_to(&resp_bytes, src).await;
-                    return;
-                }
             }
         }
-
-        // ---------- A 记录处理 ----------
-        // 1. 缓存检查
-        if self
-            .send_cached_response(&clean_domain, DNS_TYPE_A, query_msg.id(), src, "CACHE-HIT")
-            .await
-        {
-            return;
-        }
-
-        // 2. 特殊后缀检查：直接走 special_upstream
-        for suffix in &self.special_suffixes {
-            if domain_matches_suffix(&clean_domain, suffix) {
-                info!("[SPECIAL] {} -> dnsmasq", clean_domain);
-
-                let _ = self
-                    .forward_to_upstream(&request, &query_msg, &self.special_upstream, &src)
-                    .await;
-
-                return;
-            }
-        }
-
-        // 强制走国内上游
-        if is_forced(&clean_domain, &self.force_domestic) {
-            info!(
-                "[FORCE-DOMESTIC] {} -> {}",
-                clean_domain, self.domestic_upstream
-            );
-
-            let _ = self
-                .forward_to_upstream(&request, &query_msg, &self.domestic_upstream, &src)
-                .await;
-
-            return;
-        }
-
-        // 强制走国外上游
-        if is_forced(&clean_domain, &self.force_foreign) {
-            info!(
-                "[FORCE-FOREIGN] {} -> {}",
-                clean_domain, self.foreign_upstream
-            );
-
-            let _ = self
-                .forward_to_upstream(&request, &query_msg, &self.foreign_upstream, &src)
-                .await;
-
-            return;
-        }
-
-        // 3. GFWList 检查：命中则直接走 foreign_upstream
-        if let Some(ref gfw) = self.gfw_checker {
-            if gfw.check(&clean_domain) {
-                info!("[GFWLIST] {} in gfwlist, direct to foreign", clean_domain);
-
-                let _ = self
-                    .forward_to_upstream(&request, &query_msg, &self.foreign_upstream, &src)
-                    .await;
-
-                return;
-            }
-        }
-
-        // 4. 普通域名：先查国内，根据 GeoIP 决定是否改用国外
-        info!("[DOMESTIC] {} -> {}", clean_domain, self.domestic_upstream);
-
-        let domestic_resp = self.send_dns_query(&request, &self.domestic_upstream).await;
-
-        let keep_domestic = match &domestic_resp {
-            Some(resp_bytes) => match Message::from_vec(resp_bytes) {
-                Ok(msg) => {
-                    match msg.answers().iter().find_map(|rr| {
-                        if rr.record_type() == RecordType::A {
-                            rr.data().and_then(|d| d.ip_addr())
-                        } else {
-                            None
-                        }
-                    }) {
-                        Some(ip) => {
-                            let is_cn = self.is_china_ip(ip);
-
-                            if is_cn {
-                                info!("[DOMESTIC-KEEP] {} ({} - China)", clean_domain, ip);
-                                true
-                            } else {
-                                info!(
-                                    "[DOMESTIC-REJECT] {} ({} - not China) -> foreign",
-                                    clean_domain, ip
-                                );
-
-                                false
-                            }
-                        }
-                        None => {
-                            info!("[DOMESTIC-NO-IP] {} -> foreign", clean_domain);
-                            false
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to parse domestic response for {}: {}",
-                        clean_domain, e
-                    );
-
-                    false
-                }
-            },
-            None => {
-                info!("[DOMESTIC-TIMEOUT] {} -> foreign", clean_domain);
-                false
-            }
-        };
-
-        let final_resp = if keep_domestic {
-            domestic_resp.unwrap()
-        } else {
-            info!("[FOREIGN] {} -> {}", clean_domain, self.foreign_upstream);
-
-            self.query_upstream_or_servfail(
-                &request,
-                &query_msg,
-                &self.foreign_upstream,
-                Some(("FOREIGN-TIMEOUT", &clean_domain)),
-            )
-            .await
-        };
-
-        // 仅缓存成功的应答：NOERROR 且有答案，TTL 为 0 不缓存
-        self.cache_response(&clean_domain, DNS_TYPE_A, &final_resp, "CACHE-SKIP")
-            .await;
-
-        let _ = self.socket.send_to(&final_resp, src).await;
     }
-
     async fn send_dns_query(&self, request: &[u8], upstream: &SocketAddr) -> Option<Vec<u8>> {
         let socket = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => s,
