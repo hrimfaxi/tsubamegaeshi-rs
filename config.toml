@@ -1,0 +1,9 @@
+listen = "0.0.0.0:5354"
+special_suffixes = [".h", ".local", ".lan", ".home"]
+special_upstream = "127.0.0.1:5353"
+domestic_upstream = "223.5.5.5:53"
+foreign_upstream = "8.8.8.8:53"
+geoip_db = "geoip.dat"
+cache_size = 512
+query_timeout_sec = 3
+enable_ipv6_aaaa = true

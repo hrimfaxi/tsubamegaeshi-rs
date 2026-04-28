@@ -1,0 +1,19 @@
+[package]
+name = "tsubamegaeshi-rs"
+version = "0.1.0"
+edition = "2021"
+description = "燕返 — Lightweight dual-rail DNS splitter with IP-based geo decisions, caching, and Xray integration"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hickory-proto = "0.24"
+maxminddb = "0.24"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+lru = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
+anyhow = "1"
+socket2 = "0.6.3"
+clap = { version = "4", features = ["derive"] }
