@@ -17,7 +17,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tracing::{error, info};
+use tracing::{debug, error, info, trace};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -386,7 +386,7 @@ fn print_first_ip(resp: &[u8], tag: &str, domain: &str, upstream: &str) {
             }
         }
     }
-    info!("[{}] {} -> {} (no A/AAAA answer)", tag, domain, upstream);
+    error!("[{}] {} -> {} (no A/AAAA answer)", tag, domain, upstream);
 }
 
 impl DnsServer {
@@ -525,7 +525,7 @@ impl DnsServer {
         // GFWList 检查：命中则直接走 foreign_upstream
         if let Some(ref gfw) = self.gfw_checker {
             if gfw.check(clean_domain) {
-                info!(
+                trace!(
                     "[{}] {} in gfwlist, direct to foreign",
                     kind.gfwlist_tag(),
                     clean_domain
@@ -754,13 +754,13 @@ impl DnsServer {
                         chosen_tag, clean_domain, chosen_upstream, ip
                     );
                 } else {
-                    info!(
+                    error!(
                         "[{}] {} -> {} (no A/AAAA answer)",
                         chosen_tag, clean_domain, chosen_upstream
                     );
                 }
             } else {
-                info!(
+                error!(
                     "[{}] {} -> {} (no A/AAAA answer)",
                     chosen_tag, clean_domain, chosen_upstream
                 );
@@ -821,7 +821,7 @@ impl DnsServer {
             return false;
         };
 
-        info!("[{}] {}", hit_tag, domain);
+        debug!("[{}] {}", hit_tag, domain);
 
         rewrite_dns_id(&mut data, req_id);
 
@@ -870,7 +870,7 @@ impl DnsServer {
             Some(resp) => resp,
             None => {
                 if let Some((tag, domain)) = timeout_log {
-                    info!("[{}] {} -> SERVFAIL", tag, domain);
+                    error!("[{}] {} -> SERVFAIL", tag, domain);
                 }
 
                 build_servfail_response(query)
