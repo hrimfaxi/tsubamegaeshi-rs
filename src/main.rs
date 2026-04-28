@@ -949,7 +949,11 @@ async fn main() -> anyhow::Result<()> {
         tracing_subscriber::EnvFilter::from_default_env()
     };
 
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(false)
+        .without_time()
+        .init();
 
     // 加载 GeoIP
     let geoip_data = tokio::fs::read(&config.geoip_db)
