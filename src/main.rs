@@ -278,8 +278,16 @@ impl BloomDomainChecker {
     }
 
     pub fn check(&self, domain: &str) -> bool {
-        let domain_key = domain.to_lowercase().as_bytes().to_vec();
-        self.filter.check(&domain_key)
+        let mut parts: Vec<&str> = domain.split('.').collect();
+        // 至少保留 2 段（例如 google.com）
+        while parts.len() >= 2 {
+            let key = parts.join(".");
+            if self.filter.check(&key.to_lowercase().as_bytes().to_vec()) {
+                return true;
+            }
+            parts.remove(0); // 去掉最左侧子域名
+        }
+        false
     }
 }
 
