@@ -1,15 +1,19 @@
 use anyhow::{Context, Result};
 use bloomfilter::Bloom;
 use clap::Parser;
-use hickory_proto::op::{Message, ResponseCode};
-use hickory_proto::rr::RecordType;
+use hickory_proto::op::{Message, MessageType, ResponseCode};
+use hickory_proto::rr::rdata::A as ARecord;
+use hickory_proto::rr::{RData, Record, RecordType};
 use maxminddb::geoip2::City;
 use maxminddb::Reader;
 use serde::Deserialize;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
+use std::net::Ipv4Addr;
 use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -45,6 +49,8 @@ struct Config {
     force_foreign_domains: Option<Vec<String>>,
     #[serde(default)]
     force_domestic_domains: Option<Vec<String>>,
+    #[serde(default)]
+    hosts: Option<HashMap<String, String>>,
 }
 
 struct CacheEntry {
@@ -65,6 +71,7 @@ struct DnsServer {
     gfw_checker: Option<BloomDomainChecker>, // 新增 GFWList 布隆检测器
     force_foreign: Option<Vec<String>>,
     force_domestic: Option<Vec<String>>,
+    hosts: Option<HashMap<String, String>>,
 }
 
 /// 检查域名是否匹配强制列表中的任一条目（后缀匹配，覆盖子域名）
@@ -187,6 +194,24 @@ fn build_nodata_response(query: &Message) -> Vec<u8> {
     resp.to_vec().unwrap_or_default()
 }
 
+fn build_a_response(query: &Message, ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
+    let mut resp = query.clone();
+    resp.set_message_type(MessageType::Response);
+    resp.set_response_code(ResponseCode::NoError);
+    resp.set_recursion_available(true);
+    resp.answers_mut().clear();
+    resp.name_servers_mut().clear();
+
+    let mut answer = Record::new();
+    answer.set_name(query.queries()[0].name().clone());
+    answer.set_record_type(RecordType::A);
+    answer.set_ttl(ttl);
+    answer.set_data(Some(RData::A(ARecord(ip))));
+
+    resp.insert_answers(vec![answer]);
+    resp.to_vec().unwrap_or_default()
+}
+
 /// 检测 IPv6 地址是否为已知 GFW 污染地址（例如 2001::xxxx:yyyy）
 fn is_ipv6_polluted(ip: &std::net::Ipv6Addr) -> bool {
     let bytes = ip.octets();
@@ -242,6 +267,17 @@ impl DnsServer {
 
         // 处理 AAAA 查询
         if qtype == RecordType::AAAA {
+            // 如果域名存在 hosts 记录，但 hosts 中没有 IPv6 地址，
+            // 则直接返回 NODATA，避免去上游查询导致超时（尤其是上游不可用时）
+            if let Some(hosts) = &self.hosts {
+                if hosts.contains_key(&clean_domain) {
+                    info!("[HOSTS-NO-AAAA] {} in hosts, returning NODATA", clean_domain);
+                    let nodata = build_nodata_response(&query_msg);
+                    let _ = self.socket.send_to(&nodata, src).await;
+                    return;
+                }
+            }
+
             if self.enable_ipv6_aaaa {
                 // 开启 IPv6 解析：沿用 A 记录的分流逻辑（先内后外）
                 // 注意：需要确保 geoip 数据包含 IPv6 地址，否则会误判
@@ -389,6 +425,17 @@ impl DnsServer {
                 .forward_to_upstream(&request, &self.domestic_upstream, &src)
                 .await;
             return;
+        }
+
+        if let Some(hosts) = &self.hosts {
+            if let Some(ip_str) = hosts.get(&clean_domain) {
+                if let Ok(ip) = Ipv4Addr::from_str(ip_str) {
+                    let resp_bytes = build_a_response(&query_msg, ip, 60);
+                    info!("[HOSTS] {} -> {}", clean_domain, ip);
+                    let _ = self.socket.send_to(&resp_bytes, src).await;
+                    return;
+                }
+            }
         }
 
         // ---------- A 记录处理 ----------
@@ -692,6 +739,7 @@ async fn main() -> anyhow::Result<()> {
         gfw_checker,
         force_foreign: config.force_foreign_domains,
         force_domestic: config.force_domestic_domains,
+        hosts: config.hosts,
     });
 
     info!("tsubamegaeshi-rs started on {}", config.listen);
