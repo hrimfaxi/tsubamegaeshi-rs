@@ -1,16 +1,22 @@
+use anyhow::{Context, Result};
+use bloomfilter::Bloom;
+use clap::Parser;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::RecordType;
 use maxminddb::geoip2::City;
 use maxminddb::Reader;
 use serde::Deserialize;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashSet;
+use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tracing::{error, info};
 
-use clap::Parser;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 
 #[derive(Parser)]
 #[command(name = "tsubamegaeshi-rs", about = "燕返 - Lightweight DNS splitter")]
@@ -32,6 +38,9 @@ struct Config {
     query_timeout_sec: u64,
     enable_ipv6_aaaa: bool,
     log_level: Option<String>,
+    // 新增 GFWList 相关配置
+    gfwlist_path: Option<String>,
+    gfbloom_fp_rate: Option<f64>, // 默认 0.001 (0.1%)
 }
 
 struct CacheEntry {
@@ -49,7 +58,96 @@ struct DnsServer {
     cache: Option<tokio::sync::Mutex<lru::LruCache<(String, u16), CacheEntry>>>,
     timeout: Duration,
     enable_ipv6_aaaa: bool,
+    gfw_checker: Option<BloomDomainChecker>, // 新增 GFWList 布隆检测器
 }
+
+/// GFWList 解码器：负责读取、解码、解析规则并提取域名
+pub struct GfwlistDecoder {
+    file_path: String,
+}
+
+impl GfwlistDecoder {
+    pub fn new(file_path: &str) -> Self {
+        Self {
+            file_path: file_path.to_string(),
+        }
+    }
+
+    pub fn extract_domains(&self) -> Result<Vec<String>> {
+        let raw_content = fs::read_to_string(&self.file_path)
+            .with_context(|| format!("无法读取文件: {}", self.file_path))?;
+
+        let base64_str: String = raw_content.chars().filter(|c| !c.is_whitespace()).collect();
+        if base64_str.is_empty() {
+            anyhow::bail!("文件内容为空");
+        }
+
+        let decoded_bytes = STANDARD
+            .decode(&base64_str)
+            .with_context(|| "Base64 解码失败，请确认文件内容为合法的 Base64 编码")?;
+
+        let decoded_text = String::from_utf8(decoded_bytes)
+            .with_context(|| "解码后的内容不是有效的 UTF-8 文本")?;
+
+        let mut raw_domains = Vec::new();
+
+        for line in decoded_text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('!') {
+                continue;
+            }
+            if line.starts_with("@@") {
+                continue;
+            }
+            if line.starts_with("||") {
+                let rest = &line[2..];
+                let domain = rest
+                    .split(|c| c == '/' || c == '^' || c == '?' || c == '#')
+                    .next()
+                    .unwrap_or(rest);
+                let domain = domain.trim_end_matches('^').to_lowercase();
+
+                if !domain.is_empty() && !domain.contains('*') {
+                    tracing::debug!("gfwlist domain: {}", domain);
+                    raw_domains.push(domain);
+                }
+            }
+        }
+
+        let unique_domains: HashSet<String> = raw_domains.into_iter().collect();
+        Ok(unique_domains.into_iter().collect())
+    }
+}
+
+/// 基于布隆过滤器的域名检测器
+pub struct BloomDomainChecker {
+    filter: Bloom<Vec<u8>>,
+}
+
+impl BloomDomainChecker {
+    pub fn new(domains: &[String], fp_rate: f64) -> Result<Self> {
+        let num_items = domains.len();
+        if num_items == 0 {
+            anyhow::bail!("没有提供任何域名，无法构建布隆过滤器");
+        }
+
+        let mut filter = Bloom::<Vec<u8>>::new_for_fp_rate(num_items, fp_rate)
+            .map_err(|e| anyhow::anyhow!("创建布隆过滤器失败: {}", e))?;
+
+        for domain in domains {
+            filter.set(&domain.as_bytes().to_vec());
+        }
+
+        Ok(Self { filter })
+    }
+
+    pub fn check(&self, domain: &str) -> bool {
+        let domain_key = domain.to_lowercase().as_bytes().to_vec();
+        self.filter.check(&domain_key)
+    }
+}
+
+// --- DNS 服务器实现 ---
 
 fn build_nodata_response(query: &Message) -> Vec<u8> {
     let mut resp = Message::new();
@@ -121,131 +219,129 @@ impl DnsServer {
         }
 
         let qtype = query_msg.queries()[0].query_type();
+        let raw_domain = query_msg.queries()[0].name().to_utf8().to_string();
+        let clean_domain = raw_domain.trim_end_matches('.').to_string();
 
         // 处理 AAAA 查询
         if qtype == RecordType::AAAA {
             if self.enable_ipv6_aaaa {
                 // 开启 IPv6 解析：沿用 A 记录的分流逻辑（先内后外）
                 // 注意：需要确保 geoip 数据包含 IPv6 地址，否则会误判
-                let raw_domain = query_msg.queries()[0].name().to_utf8().to_string();
-                let domain = raw_domain.trim_end_matches('.').to_string();
-
                 // 特殊后缀检查（如果你希望 .h 支持 IPv6）
                 for suffix in &self.special_suffixes {
-                    if domain.ends_with(suffix) {
-                        info!("[SPECIAL-AAAA] {} -> dnsmasq", domain);
-                        let _ = self.forward_to_upstream(&request, &self.special_upstream, &src).await;
+                    if clean_domain.ends_with(suffix) {
+                        info!("[SPECIAL-AAAA] {} -> dnsmasq", clean_domain);
+                        let _ = self
+                            .forward_to_upstream(&request, &self.special_upstream, &src)
+                            .await;
                         return;
                     }
                 }
 
-                if self.enable_ipv6_aaaa {
-                    let raw_domain = query_msg.queries()[0].name().to_utf8().to_string();
-                    let domain = raw_domain.trim_end_matches('.').to_string();
-
-                    // 特殊后缀直接转发
-                    for suffix in &self.special_suffixes {
-                        if domain.ends_with(suffix) {
-                            info!("[SPECIAL-AAAA] {} -> dnsmasq", domain);
-                            let _ = self.forward_to_upstream(&request, &self.special_upstream, &src).await;
-                            return;
-                        }
+                // GFWList 检查（直接走 foreign）
+                if let Some(ref gfw) = self.gfw_checker {
+                    if gfw.check(&clean_domain) {
+                        info!(
+                            "[GFWLIST-AAAA] {} in gfwlist, direct to foreign",
+                            clean_domain
+                        );
+                        let _ = self
+                            .forward_to_upstream(&request, &self.foreign_upstream, &src)
+                            .await;
+                        return;
                     }
+                }
 
-                    // 先查国内上游
-                    let domestic_resp = self.send_dns_query(&request, &self.domestic_upstream).await;
-                    let use_domestic = match &domestic_resp {
-                        Some(data) => {
-                            // 尝试提取第一个 IPv6 地址
-                            if let Ok(msg) = Message::from_vec(data) {
-                                let first_ipv6 = msg.answers().iter().find_map(|rr| {
-                                    if rr.record_type() == RecordType::AAAA {
-                                        rr.data().and_then(|d| d.ip_addr())
+                // 域名不在 GFWList 中，继续原有逻辑
+                let domestic_resp = self.send_dns_query(&request, &self.domestic_upstream).await;
+                let use_domestic = match &domestic_resp {
+                    Some(data) => {
+                        if let Ok(msg) = Message::from_vec(data) {
+                            let first_ipv6 = msg.answers().iter().find_map(|rr| {
+                                if rr.record_type() == RecordType::AAAA {
+                                    rr.data().and_then(|d| d.ip_addr())
+                                } else {
+                                    None
+                                }
+                            });
+                            match first_ipv6 {
+                                Some(IpAddr::V6(ipv6)) => {
+                                    if is_ipv6_polluted(&ipv6) {
+                                        info!(
+                                            "[DOMESTIC-POLLUTED] {} ({}) -> foreign",
+                                            clean_domain, ipv6
+                                        );
+                                        false
                                     } else {
-                                        None
-                                    }
-                                });
-                                match first_ipv6 {
-                                    Some(std::net::IpAddr::V6(ipv6)) => {
-                                        if is_ipv6_polluted(&ipv6) {
-                                            info!("[DOMESTIC-POLLUTED] {} ({}) -> foreign", domain, ipv6);
-                                            false
-                                        } else {
-                                            // 目前没有 IPv6 GeoIP，暂且信任非污染 IPv6
-                                            info!("[DOMESTIC-KEEP] {} ({})", domain, ipv6);
-                                            true
-                                        }
-                                    }
-                                    Some(v4) => {
-                                        // 理论上不会出现，但保留判断
-                                        info!("[DOMESTIC-A] {} (v4 in AAAA?) {:?}", domain, v4);
+                                        info!("[DOMESTIC-KEEP] {} ({})", clean_domain, ipv6);
                                         true
                                     }
-                                    None => {
-                                        info!("[DOMESTIC-NO-IP] {} -> foreign", domain);
-                                        false
-                                    }
                                 }
-                            } else {
-                                info!("[DOMESTIC-PARSE-ERR] {} -> foreign", domain);
-                                false
+                                Some(_) => true,
+                                None => {
+                                    info!("[DOMESTIC-NO-IP] {} -> foreign", clean_domain);
+                                    false
+                                }
                             }
-                        }
-                        None => {
-                            info!("[DOMESTIC-TIMEOUT] {} -> foreign", domain);
+                        } else {
+                            info!("[DOMESTIC-PARSE-ERR] {} -> foreign", clean_domain);
                             false
                         }
-                    };
+                    }
+                    None => {
+                        info!("[DOMESTIC-TIMEOUT] {} -> foreign", clean_domain);
+                        false
+                    }
+                };
 
-                    let final_resp = if use_domestic {
-                        domestic_resp.unwrap()
-                    } else {
-                        info!("[FOREIGN] {} -> {}", domain, self.foreign_upstream);
-                        match self.send_dns_query(&request, &self.foreign_upstream).await {
-                            Some(resp) => resp,
-                            None => {
-                                info!("[FOREIGN-TIMEOUT] {} -> SERVFAIL", domain);
-                                let mut servfail = Message::new();
-                                servfail.set_id(query_msg.id());
-                                servfail.set_response_code(ResponseCode::ServFail);
-                                servfail.to_vec().unwrap_or_default()
-                            }
-                        }
-                    };
-
-                    // 缓存成功的 AAAA 应答（与 A 记录缓存策略一致）
-                    if let Some(cache) = &self.cache {
-                        if let Ok(msg) = Message::from_vec(&final_resp) {
-                            if msg.response_code() == ResponseCode::NoError && !msg.answers().is_empty() {
-                                let mut cache = cache.lock().await;
-                                let min_ttl = msg.answers().iter().map(|rr| rr.ttl()).min().unwrap_or(60);
-                                let effective_ttl = std::cmp::max(min_ttl, 60);
-                                let expire = Instant::now() + Duration::from_secs(effective_ttl as u64);
-                                cache.put(
-                                    (domain.clone(), 28), // 28 = AAAA 的 QTYPE 编号
-                                    CacheEntry {
-                                        data: final_resp.clone(),
-                                        expire,
-                                    },
-                                );
-                            }
+                let final_resp = if use_domestic {
+                    domestic_resp.unwrap()
+                } else {
+                    info!(
+                        "[FOREIGN-AAAA] {} -> {}",
+                        clean_domain, self.foreign_upstream
+                    );
+                    match self.send_dns_query(&request, &self.foreign_upstream).await {
+                        Some(resp) => resp,
+                        None => {
+                            let mut servfail = Message::new();
+                            servfail.set_id(query_msg.id());
+                            servfail.set_response_code(ResponseCode::ServFail);
+                            servfail.to_vec().unwrap_or_default()
                         }
                     }
-                    let _ = self.socket.send_to(&final_resp, src).await;
-                    return;
+                };
+
+                // 缓存（与 A 记录类似）
+                if let Some(cache) = &self.cache {
+                    if let Ok(msg) = Message::from_vec(&final_resp) {
+                        if msg.response_code() == ResponseCode::NoError && !msg.answers().is_empty()
+                        {
+                            let mut cache = cache.lock().await;
+                            let min_ttl =
+                                msg.answers().iter().map(|rr| rr.ttl()).min().unwrap_or(60);
+                            let effective_ttl = std::cmp::max(min_ttl, 60);
+                            let expire = Instant::now() + Duration::from_secs(effective_ttl as u64);
+                            cache.put(
+                                (clean_domain.clone(), 28),
+                                CacheEntry {
+                                    data: final_resp.clone(),
+                                    expire,
+                                },
+                            );
+                        }
+                    }
                 }
+                let _ = self.socket.send_to(&final_resp, src).await;
             } else {
-                // 关闭 IPv6：返回标准 NODATA
                 let nodata = build_nodata_response(&query_msg);
                 let _ = self.socket.send_to(&nodata, src).await;
-                return;
             }
+            return;
         }
 
-        // 其他非 A 查询（包括 NS、MX、TXT 等）直接转发给国内上游
+        // 非 A 查询直接给国内上游
         if qtype != RecordType::A {
-            let raw_domain = query_msg.queries()[0].name().to_utf8().to_string();
-            let clean_domain = raw_domain.trim_end_matches('.').to_string();
             tracing::debug!("[NON-A] {} type={:?} -> domestic", clean_domain, qtype);
             let _ = self
                 .forward_to_upstream(&request, &self.domestic_upstream, &src)
@@ -253,16 +349,8 @@ impl DnsServer {
             return;
         }
 
-        let raw_domain = query_msg.queries()[0].name().to_utf8().to_string();
-        let clean_domain = raw_domain.trim_end_matches('.').to_string();
-        tracing::debug!(
-            "raw_domain='{}' clean_domain='{}' suffixes={:?}",
-            raw_domain,
-            clean_domain,
-            self.special_suffixes
-        );
-
-        // 检查缓存（键用 clean_domain）
+        // ---------- A 记录处理 ----------
+        // 1. 缓存检查
         if let Some(cache_ref) = &self.cache {
             let mut cache = cache_ref.lock().await;
             if let Some(entry) = cache.get(&(clean_domain.clone(), 1)) {
@@ -281,7 +369,7 @@ impl DnsServer {
             }
         }
 
-        // 特殊后缀直接转发 dnsmasq（用 clean_domain 匹配）
+        // 2. 特殊后缀检查（直接走 special_upstream）
         for suffix in &self.special_suffixes {
             if clean_domain.ends_with(suffix) {
                 info!("[SPECIAL] {} -> dnsmasq", clean_domain);
@@ -292,7 +380,18 @@ impl DnsServer {
             }
         }
 
-        // 第一阶段：查询国内上游
+        // 3. GFWList 检查：命中则直接走 foreign_upstream（不经过国内上游）
+        if let Some(ref gfw) = self.gfw_checker {
+            if gfw.check(&clean_domain) {
+                info!("[GFWLIST] {} in gfwlist, direct to foreign", clean_domain);
+                let _ = self
+                    .forward_to_upstream(&request, &self.foreign_upstream, &src)
+                    .await;
+                return;
+            }
+        }
+
+        // 4. 普通域名：先查国内，根据 GeoIP 决定是否改用国外
         info!("[DOMESTIC] {} -> {}", clean_domain, self.domestic_upstream);
         let domestic_resp = self.send_dns_query(&request, &self.domestic_upstream).await;
 
@@ -441,27 +540,53 @@ impl DnsServer {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Load configuration
     let config_str = tokio::fs::read_to_string(&cli.config)
         .await
         .expect("Failed to read config.toml");
     let config: Config = toml::from_str(&config_str).expect("Invalid config.toml");
 
-    // 构建 EnvFilter：优先使用配置文件中的 log_level
     let env_filter = if let Some(ref level) = config.log_level {
         tracing_subscriber::EnvFilter::new(level)
     } else {
         tracing_subscriber::EnvFilter::from_default_env()
     };
-
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    // Load GeoIP database
+    // 加载 GeoIP
     let geoip_data = tokio::fs::read(&config.geoip_db)
         .await
         .expect("Failed to read GeoIP database");
     let geoip = Reader::from_source(geoip_data).expect("Invalid GeoIP database");
 
+    // 加载 GFWList 并构建布隆过滤器
+    let gfw_checker = if let Some(path) = &config.gfwlist_path {
+        info!("Loading GFWList from {}", path);
+        match GfwlistDecoder::new(path).extract_domains() {
+            Ok(domains) => {
+                info!("Extracted {} unique domains from GFWList", domains.len());
+                let fp_rate = config.gfbloom_fp_rate.unwrap_or(0.001);
+                match BloomDomainChecker::new(&domains, fp_rate) {
+                    Ok(checker) => {
+                        info!("Bloom filter built with fp_rate={:.2}%", fp_rate * 100.0);
+                        Some(checker)
+                    }
+                    Err(e) => {
+                        error!("Failed to build bloom filter: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to parse GFWList: {}", e);
+                None
+            }
+        }
+    } else {
+        info!("No GFWList path provided, skipping GFW filter");
+        None
+    };
+
+    // 绑定 UDP socket
     let addr: SocketAddr = config.listen.parse()?;
     let socket = match addr {
         SocketAddr::V4(_) => {
@@ -498,6 +623,7 @@ async fn main() -> anyhow::Result<()> {
         cache,
         timeout: Duration::from_secs(config.query_timeout_sec),
         enable_ipv6_aaaa: config.enable_ipv6_aaaa,
+        gfw_checker,
     });
 
     info!("tsubamegaeshi-rs started on {}", config.listen);

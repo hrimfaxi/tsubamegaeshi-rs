@@ -17,3 +17,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] 
 anyhow = "1"
 socket2 = "0.6.3"
 clap = { version = "4", features = ["derive"] }
+base64 = "0.21"
+bloomfilter = "3"
