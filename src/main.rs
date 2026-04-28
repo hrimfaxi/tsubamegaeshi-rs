@@ -41,6 +41,10 @@ struct Config {
     // 新增 GFWList 相关配置
     gfwlist_path: Option<String>,
     gfbloom_fp_rate: Option<f64>, // 默认 0.001 (0.1%)
+    #[serde(default)]
+    force_foreign_domains: Option<Vec<String>>,
+    #[serde(default)]
+    force_domestic_domains: Option<Vec<String>>,
 }
 
 struct CacheEntry {
@@ -59,6 +63,20 @@ struct DnsServer {
     timeout: Duration,
     enable_ipv6_aaaa: bool,
     gfw_checker: Option<BloomDomainChecker>, // 新增 GFWList 布隆检测器
+    force_foreign: Option<Vec<String>>,
+    force_domestic: Option<Vec<String>>,
+}
+
+/// 检查域名是否匹配强制列表中的任一条目（后缀匹配，覆盖子域名）
+fn is_forced(domain: &str, list: &Option<Vec<String>>) -> bool {
+    if let Some(items) = list {
+        for pattern in items {
+            if domain == *pattern || domain.ends_with(&format!(".{}", pattern)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// GFWList 解码器：负责读取、解码、解析规则并提取域名
@@ -238,6 +256,30 @@ impl DnsServer {
                     }
                 }
 
+                // 强制国内（AAAA）
+                if is_forced(&clean_domain, &self.force_domestic) {
+                    info!(
+                        "[FORCE-DOMESTIC-AAAA] {} -> {}",
+                        clean_domain, self.domestic_upstream
+                    );
+                    let _ = self
+                        .forward_to_upstream(&request, &self.domestic_upstream, &src)
+                        .await;
+                    return;
+                }
+
+                // 强制国外（AAAA）
+                if is_forced(&clean_domain, &self.force_foreign) {
+                    info!(
+                        "[FORCE-FOREIGN-AAAA] {} -> {}",
+                        clean_domain, self.foreign_upstream
+                    );
+                    let _ = self
+                        .forward_to_upstream(&request, &self.foreign_upstream, &src)
+                        .await;
+                    return;
+                }
+
                 // GFWList 检查（直接走 foreign）
                 if let Some(ref gfw) = self.gfw_checker {
                     if gfw.check(&clean_domain) {
@@ -378,6 +420,30 @@ impl DnsServer {
                     .await;
                 return;
             }
+        }
+
+        // 强制走国内上游（如果配置了）
+        if is_forced(&clean_domain, &self.force_domestic) {
+            info!(
+                "[FORCE-DOMESTIC] {} -> {}",
+                clean_domain, self.domestic_upstream
+            );
+            let _ = self
+                .forward_to_upstream(&request, &self.domestic_upstream, &src)
+                .await;
+            return;
+        }
+
+        // 强制走国外上游（如果配置了）
+        if is_forced(&clean_domain, &self.force_foreign) {
+            info!(
+                "[FORCE-FOREIGN] {} -> {}",
+                clean_domain, self.foreign_upstream
+            );
+            let _ = self
+                .forward_to_upstream(&request, &self.foreign_upstream, &src)
+                .await;
+            return;
         }
 
         // 3. GFWList 检查：命中则直接走 foreign_upstream（不经过国内上游）
@@ -624,6 +690,8 @@ async fn main() -> anyhow::Result<()> {
         timeout: Duration::from_secs(config.query_timeout_sec),
         enable_ipv6_aaaa: config.enable_ipv6_aaaa,
         gfw_checker,
+        force_foreign: config.force_foreign_domains,
+        force_domestic: config.force_domestic_domains,
     });
 
     info!("tsubamegaeshi-rs started on {}", config.listen);
