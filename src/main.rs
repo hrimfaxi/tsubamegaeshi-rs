@@ -368,6 +368,25 @@ impl DnsServer {
         );
     }
 
+    async fn query_upstream_or_servfail(
+        &self,
+        request: &[u8],
+        query: &Message,
+        upstream: &SocketAddr,
+        timeout_log: Option<(&str, &str)>,
+    ) -> Vec<u8> {
+        match self.send_dns_query(request, upstream).await {
+            Some(resp) => resp,
+            None => {
+                if let Some((tag, domain)) = timeout_log {
+                    info!("[{}] {} -> SERVFAIL", tag, domain);
+                }
+
+                build_servfail_response(query)
+            }
+        }
+    }
+
     async fn run(self: Arc<Self>) {
         let mut buf = [0u8; 4096];
 
@@ -566,13 +585,13 @@ impl DnsServer {
                     clean_domain, self.foreign_upstream
                 );
 
-                match self.send_dns_query(&request, &self.foreign_upstream).await {
-                    Some(resp) => resp,
-                    None => {
-                        info!("[FOREIGN-TIMEOUT-AAAA] {} -> SERVFAIL", clean_domain);
-                        build_servfail_response(&query_msg)
-                    }
-                }
+                self.query_upstream_or_servfail(
+                    &request,
+                    &query_msg,
+                    &self.foreign_upstream,
+                    Some(("FOREIGN-TIMEOUT-AAAA", &clean_domain)),
+                )
+                .await
             };
 
             // 缓存 AAAA 响应：只缓存 NOERROR 且有答案，TTL 为 0 不缓存
@@ -727,13 +746,13 @@ impl DnsServer {
         } else {
             info!("[FOREIGN] {} -> {}", clean_domain, self.foreign_upstream);
 
-            match self.send_dns_query(&request, &self.foreign_upstream).await {
-                Some(resp) => resp,
-                None => {
-                    info!("[FOREIGN-TIMEOUT] {} -> SERVFAIL", clean_domain);
-                    build_servfail_response(&query_msg)
-                }
-            }
+            self.query_upstream_or_servfail(
+                &request,
+                &query_msg,
+                &self.foreign_upstream,
+                Some(("FOREIGN-TIMEOUT", &clean_domain)),
+            )
+            .await
         };
 
         // 仅缓存成功的应答：NOERROR 且有答案，TTL 为 0 不缓存
@@ -779,10 +798,9 @@ impl DnsServer {
         upstream: &SocketAddr,
         client: &SocketAddr,
     ) -> anyhow::Result<()> {
-        let data = match self.send_dns_query(request, upstream).await {
-            Some(resp) => resp,
-            None => build_servfail_response(query),
-        };
+        let data = self
+            .query_upstream_or_servfail(request, query, upstream, None)
+            .await;
 
         self.socket.send_to(&data, client).await?;
 
