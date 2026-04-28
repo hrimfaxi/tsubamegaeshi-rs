@@ -373,6 +373,22 @@ fn is_ipv6_polluted(ip: &std::net::Ipv6Addr) -> bool {
     bytes[2..12].iter().all(|&b| b == 0)
 }
 
+fn print_first_ip(resp: &[u8], tag: &str, domain: &str, upstream: &str) {
+    if let Ok(msg) = Message::from_vec(resp) {
+        if let Some(rr) = msg
+            .answers()
+            .iter()
+            .find(|rr| rr.record_type() == RecordType::A || rr.record_type() == RecordType::AAAA)
+        {
+            if let Some(ip) = rr.data().and_then(|d| d.ip_addr()) {
+                info!("[{}] {} -> {} = {}", tag, domain, upstream, ip);
+                return;
+            }
+        }
+    }
+    info!("[{}] {} -> {} (no A/AAAA answer)", tag, domain, upstream);
+}
+
 impl DnsServer {
     async fn handle_hosts_override(
         &self,
@@ -420,6 +436,21 @@ impl DnsServer {
         }
     }
 
+    async fn forward_to_upstream_and_get(
+        &self,
+        request: &[u8],
+        query: &Message,
+        upstream: &SocketAddr,
+        client: &SocketAddr,
+    ) -> Vec<u8> {
+        let data = self
+            .query_upstream_or_servfail(request, query, upstream, None)
+            .await;
+
+        let _ = self.socket.send_to(&data, client).await;
+        data
+    }
+
     async fn forward_by_static_rules(
         &self,
         kind: AddressQueryKind,
@@ -433,10 +464,16 @@ impl DnsServer {
             if domain_matches_suffix(clean_domain, suffix) {
                 info!("[{}] {} -> dnsmasq", kind.special_tag(), clean_domain);
 
-                let _ = self
-                    .forward_to_upstream(request, query_msg, &self.special_upstream, &src)
+                let resp = self
+                    .forward_to_upstream_and_get(request, query_msg, &self.special_upstream, &src)
                     .await;
 
+                print_first_ip(
+                    &resp,
+                    kind.special_tag(),
+                    clean_domain,
+                    &self.special_upstream.to_string(),
+                );
                 return true;
             }
         }
@@ -450,10 +487,16 @@ impl DnsServer {
                 self.domestic_upstream
             );
 
-            let _ = self
-                .forward_to_upstream(request, query_msg, &self.domestic_upstream, &src)
+            let resp = self
+                .forward_to_upstream_and_get(request, query_msg, &self.domestic_upstream, &src)
                 .await;
 
+            print_first_ip(
+                &resp,
+                kind.force_domestic_tag(),
+                clean_domain,
+                &self.domestic_upstream.to_string(),
+            );
             return true;
         }
 
@@ -466,10 +509,16 @@ impl DnsServer {
                 self.foreign_upstream
             );
 
-            let _ = self
-                .forward_to_upstream(request, query_msg, &self.foreign_upstream, &src)
+            let resp = self
+                .forward_to_upstream_and_get(request, query_msg, &self.foreign_upstream, &src)
                 .await;
 
+            print_first_ip(
+                &resp,
+                kind.force_foreign_tag(),
+                clean_domain,
+                &self.foreign_upstream.to_string(),
+            );
             return true;
         }
 
@@ -482,10 +531,16 @@ impl DnsServer {
                     clean_domain
                 );
 
-                let _ = self
-                    .forward_to_upstream(request, query_msg, &self.foreign_upstream, &src)
+                let resp = self
+                    .forward_to_upstream_and_get(request, query_msg, &self.foreign_upstream, &src)
                     .await;
 
+                print_first_ip(
+                    &resp,
+                    kind.gfwlist_tag(),
+                    clean_domain,
+                    &self.foreign_upstream.to_string(),
+                );
                 return true;
             }
         }
@@ -669,24 +724,48 @@ impl DnsServer {
 
         let use_domestic = self.should_use_domestic_response(kind, clean_domain, &domestic_resp);
 
-        let final_resp = if use_domestic {
-            domestic_resp.unwrap()
-        } else {
-            info!(
-                "[{}] {} -> {}",
-                kind.foreign_tag(),
-                clean_domain,
-                self.foreign_upstream
-            );
-
-            self.query_upstream_or_servfail(
-                request,
-                query_msg,
-                &self.foreign_upstream,
-                Some((kind.foreign_timeout_tag(), clean_domain)),
+        let (final_resp, chosen_tag, chosen_upstream) = if use_domestic {
+            let resp = domestic_resp.unwrap();
+            (
+                resp,
+                kind.domestic_tag(),
+                self.domestic_upstream.to_string(),
             )
-            .await
+        } else {
+            let resp = self
+                .query_upstream_or_servfail(
+                    request,
+                    query_msg,
+                    &self.foreign_upstream,
+                    Some((kind.foreign_timeout_tag(), clean_domain)),
+                )
+                .await;
+            (resp, kind.foreign_tag(), self.foreign_upstream.to_string())
         };
+
+        // 打印解析结果
+        if let Ok(msg) = Message::from_vec(&final_resp) {
+            if let Some(rr) = msg.answers().iter().find(|rr| {
+                rr.record_type() == RecordType::A || rr.record_type() == RecordType::AAAA
+            }) {
+                if let Some(ip) = rr.data().and_then(|d| d.ip_addr()) {
+                    info!(
+                        "[{}] {} -> {} resolved to {}",
+                        chosen_tag, clean_domain, chosen_upstream, ip
+                    );
+                } else {
+                    info!(
+                        "[{}] {} -> {} (no A/AAAA answer)",
+                        chosen_tag, clean_domain, chosen_upstream
+                    );
+                }
+            } else {
+                info!(
+                    "[{}] {} -> {} (no A/AAAA answer)",
+                    chosen_tag, clean_domain, chosen_upstream
+                );
+            }
+        }
 
         // 只缓存 NOERROR 且有答案，TTL 为 0 不缓存
         self.cache_response(
