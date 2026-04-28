@@ -225,7 +225,7 @@ fn is_ipv6_polluted(ip: &std::net::Ipv6Addr) -> bool {
 
 impl DnsServer {
     async fn run(self: Arc<Self>) {
-        let mut buf = [0u8; 512];
+        let mut buf = [0u8; 4096];
         loop {
             let (len, src) = match self.socket.recv_from(&mut buf).await {
                 Ok(v) => v,
@@ -603,7 +603,7 @@ impl DnsServer {
             return None;
         }
 
-        let mut buf = [0u8; 512];
+        let mut buf = [0u8; 4096];
         match tokio::time::timeout(self.timeout, socket.recv_from(&mut buf)).await {
             Ok(Ok((len, _))) => Some(buf[..len].to_vec()),
             Ok(Err(e)) => {
