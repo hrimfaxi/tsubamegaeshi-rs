@@ -598,7 +598,7 @@ impl DnsServer {
                             let is_cn = self.is_china_ip(ip);
 
                             if is_cn {
-                                info!("[DOMESTIC-KEEP] {} ({} - China)", clean_domain, ip);
+                                debug!("[DOMESTIC-KEEP] {} ({} - China)", clean_domain, ip);
                                 true
                             } else {
                                 info!(
@@ -625,7 +625,7 @@ impl DnsServer {
                 }
             },
             None => {
-                info!("[DOMESTIC-TIMEOUT] {} -> foreign", clean_domain);
+                error!("[DOMESTIC-TIMEOUT] {} -> foreign", clean_domain);
                 false
             }
         }
@@ -657,7 +657,7 @@ impl DnsServer {
 
                                 false
                             } else {
-                                info!("[DOMESTIC-KEEP-AAAA] {} ({})", clean_domain, ipv6);
+                                debug!("[DOMESTIC-KEEP-AAAA] {} ({})", clean_domain, ipv6);
                                 true
                             }
                         }
@@ -676,7 +676,7 @@ impl DnsServer {
                 }
             }
             None => {
-                info!("[DOMESTIC-TIMEOUT-AAAA] {} -> foreign", clean_domain);
+                error!("[DOMESTIC-TIMEOUT-AAAA] {} -> foreign", clean_domain);
                 false
             }
         }
@@ -744,7 +744,7 @@ impl DnsServer {
         }
 
         // 普通域名：先查国内，根据 A/AAAA 各自规则判断是否使用国内结果
-        info!(
+        debug!(
             "[{}] {} -> {}",
             kind.domestic_tag(),
             clean_domain,
