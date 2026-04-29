@@ -42,6 +42,7 @@ start_service() {
     procd_set_param group "$RUN_USER"
     procd_set_param no_new_privs 1
     procd_add_jail_mount "/etc/tsubamegaeshi-rs"
+    procd_add_jail_mount "/usr/sbin/nft"
   fi
 
   procd_set_param command "$BIN" -c "$CONFIG_FILE"
