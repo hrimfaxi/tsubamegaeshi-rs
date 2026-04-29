@@ -931,11 +931,17 @@ impl DnsServer {
     }
 
     async fn handle_request(&self, request: Vec<u8>, src: SocketAddr) {
+        let started_at = Instant::now();
+
         // 解析查询
         let query_msg = match Message::from_vec(&request) {
             Ok(m) => m,
             Err(e) => {
-                error!("Failed to parse DNS request from {}: {}", src, e);
+                let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+                error!(
+                    "Failed to parse DNS request from {}: {}, cost={:.3}ms",
+                    src, e, elapsed_ms
+                );
                 return;
             }
         };
@@ -944,6 +950,13 @@ impl DnsServer {
             // 多问题报文极少见，直接返回 SERVFAIL
             let servfail = build_servfail_response(&query_msg);
             let _ = self.socket.send_to(&servfail, src).await;
+
+            let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+            info!(
+                "[DONE] {} multi-query -> SERVFAIL, cost={:.3}ms",
+                src, elapsed_ms
+            );
+
             return;
         }
 
@@ -984,7 +997,15 @@ impl DnsServer {
                     .await;
             }
         }
+
+        let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+
+        info!(
+            "[DONE] {} type={:?} from={} cost={:.3}ms",
+            clean_domain, qtype, src, elapsed_ms
+        );
     }
+
     async fn send_dns_query(&self, request: &[u8], upstream: &SocketAddr) -> Option<Vec<u8>> {
         let socket = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => s,
