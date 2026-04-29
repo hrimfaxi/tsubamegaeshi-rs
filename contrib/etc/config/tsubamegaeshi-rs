@@ -1,0 +1,5 @@
+config main 'service'
+    option enabled '1'
+    option config '/etc/tsubamegaeshi-rs/config.toml'
+    option user 'nobody'
+    option nofile '1024768'

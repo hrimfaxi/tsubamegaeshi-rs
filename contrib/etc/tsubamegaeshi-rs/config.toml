@@ -1,0 +1,106 @@
+listen = "[::]:53"
+special_suffixes = [".h", ".local", ".lan", ".home", ".yellowbigbird.com", ]
+special_upstream = "127.0.0.1:5353"
+domestic_upstream = "223.5.5.5:53"
+#foreign_upstream = "206.237.23.241:5353"
+foreign_upstream = "127.0.0.1:5354"
+cache_size = 300
+query_timeout_sec = 3
+log_level = "debug"
+enable_ipv6_aaaa = false
+gfwlist_path = "/etc/tsubamegaeshi-rs/gfwlist.txt"
+mmdb_path = "/etc/tsubamegaeshi-rs/Country-only-cn-private.mmdb"
+gfbloom_fp_rate = 0.001
+
+force_foreign_domains = [
+  "syncthing.net",
+]
+
+force_domestic_domains = [
+  "miui.com",
+]
+
+# 静态 hosts 记录 (用于关键域名兜底，避免 Xray 未启动时无法解析)
+[hosts.ipv4]
+"aliyun.yellowbigbird.com" = "47.108.136.105"
+"rack-real.yellowbigbird.com" = "107.174.121.146"
+"bird2.yellowbigbird.com" = "172.93.188.169"
+"bird4.yellowbigbird.com" = "8.210.12.134"
+"niyaou.yellowbigbird.com" = "144.34.136.17"
+"niyaou2.yellowbigbird.com" = "66.112.212.45"
+"vmshell.yellowbigbird.com" = "23.173.216.120"
+"zgo.yellowbigbird.com" = "23.185.200.253"
+"vultr.yellowbigbird.com" = "45.77.70.206"
+"ip.3322.net" = "118.184.169.32"
+
+[hosts.ipv6]
+"vultr.yellowbigbird.com" = "2001:19f0:6001:804:5400:1ff:fe39:3399"
+
+[marksite]
+youtube = [
+    "googlevideo.com",
+    "youtubei.googleapis.com",
+    "youtube.googleapis.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+    "youtubeembeddedplayer.googleapis.com",
+    "withyoutube.com",
+    "youtubekids.com",
+    "youtubegaming.com",
+    "youtubefanfest.com",
+    "youtubeeducation.com",
+    "ytimg.com",
+    "ggpht.com",
+    "1e100.net",
+]
+
+douyin = [
+    "amemv.com",
+    "baijiahao.baidu.com",
+    "bdurl.net",
+    "bytedance.net",
+    "dm.toutiao.com",
+    "douyin.com",
+    "douyincdn.com",
+    "douyincdn.com",
+    "gifshow.com",
+    "haokan.baidu.com",
+    "hs.ixigua.com",
+    "hs.pstatp.com",
+    "huawei.com",
+    "huaweicloud.com",
+    "huoshan.com",
+    "ixigua.com",
+    "ixiguavideo.com",
+    "ksapisrv.com",
+    "kuaishou.com",
+    "kuaishoupay.com",
+    "meipai.com",
+    "miaopai.com",
+    "qupai.me",
+    "snssdk.com",
+    "tieba.baidu.com",
+    "tieba.com",
+    "tiktokv.com",
+    "toutiao.com",
+    "kandian.qq.com",
+    "weishi.qq.com",
+    "xiongzhang.baidu.com",
+    "yximgs.com",
+    "sns-video-ak.xhscdn.com",
+    "tiktok.com",
+    "xiaohongshu.com",
+    "toutiao.com",
+    "snssdk",
+    "douyin",
+    "toutiao",
+    "ixigua",
+    "365yg",
+    "amemv",
+    "weishi.qq.com",
+    "tiktok",
+    "xhscdn.com",
+    "gitv.tv",
+    "aisee.tv",
+    "atianqi.com",
+]
