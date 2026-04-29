@@ -17,13 +17,13 @@ BIN=target/aarch64-unknown-linux-musl/release/tsubamegaeshi-rs
 aarch64-openwrt-linux-musl-strip $BIN
 
 # upx 压缩（需要本地安装 upx）
-if command -v upx &> /dev/null; then
-    upx --best $BIN
-    echo "UPX compression done"
+if command -v upx &>/dev/null; then
+  upx -3 $BIN
+  echo "UPX compression done"
 else
-    echo "upx not found, skipping compression"
+  echo "upx not found, skipping compression"
 fi
 
 # 上传并重启
-rsync -avrPzz $BIN zdxlz:/usr/bin
-ssh zdxlz service tsubamegaeshi-rs restart
+#rsync -avrPzz $BIN zdxlz:/usr/bin
+#ssh zdxlz service tsubamegaeshi-rs restart

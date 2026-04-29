@@ -9,7 +9,7 @@ BIN=target/mipsel-unknown-linux-musl/release/tsubamegaeshi-rs
 
 # upx 压缩（需要本地安装 upx）
 if command -v upx &>/dev/null; then
-  upx --best $BIN
+  upx -3 $BIN
   echo "UPX compression done"
 else
   echo "upx not found, skipping compression"
