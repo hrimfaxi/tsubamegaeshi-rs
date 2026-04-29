@@ -5,8 +5,8 @@ use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::rdata::A as ARecord;
 use hickory_proto::rr::rdata::AAAA as AAAARecord;
 use hickory_proto::rr::{RData, Record, RecordType};
-use maxminddb::geoip2::City;
 use maxminddb::Reader;
+use maxminddb::geoip2::City;
 use serde::Deserialize;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
@@ -20,10 +20,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_AAAA: u16 = 28;
@@ -259,7 +259,7 @@ impl GfwlistDecoder {
                 let domain = domain.trim_end_matches('^').to_lowercase();
 
                 if !domain.is_empty() && !domain.contains('*') {
-                    tracing::debug!("gfwlist domain: {}", domain);
+                    debug!("gfwlist domain: {}", domain);
                     raw_domains.push(domain);
                 }
             }
@@ -419,7 +419,7 @@ fn print_first_ip(resp: &[u8], tag: &str, domain: &str, upstream: &str) {
             }
         }
     }
-    error!("[{}] {} -> {} (no A/AAAA answer)", tag, domain, upstream);
+    warn!("[{}] {} -> {} (no A/AAAA answer)", tag, domain, upstream);
 }
 
 impl DnsServer {
@@ -476,7 +476,7 @@ impl DnsServer {
                         ip, table, e
                     );
                 } else {
-                    info!("[mark_sites] Added {} to table {}", ip, table);
+                    debug!("[mark_sites] Added {} to table {}", ip, table);
                 }
             }
         });
@@ -579,7 +579,7 @@ impl DnsServer {
 
         // 强制走国内上游
         if is_forced(clean_domain, &self.force_domestic) {
-            info!(
+            debug!(
                 "[{}] {} -> {}",
                 kind.force_domestic_tag(),
                 clean_domain,
@@ -672,7 +672,7 @@ impl DnsServer {
                                 debug!("[DOMESTIC-KEEP] {} ({} - China)", clean_domain, ip);
                                 true
                             } else {
-                                info!(
+                                debug!(
                                     "[DOMESTIC-REJECT] {} ({} - not China) -> foreign",
                                     clean_domain, ip
                                 );
@@ -681,13 +681,13 @@ impl DnsServer {
                             }
                         }
                         None => {
-                            info!("[DOMESTIC-NO-IP] {} -> foreign", clean_domain);
+                            debug!("[DOMESTIC-NO-IP] {} -> foreign", clean_domain);
                             false
                         }
                     }
                 }
                 Err(e) => {
-                    error!(
+                    warn!(
                         "Failed to parse domestic response for {}: {}",
                         clean_domain, e
                     );
@@ -696,7 +696,7 @@ impl DnsServer {
                 }
             },
             None => {
-                error!("[DOMESTIC-TIMEOUT] {} -> foreign", clean_domain);
+                warn!("[DOMESTIC-TIMEOUT] {} -> foreign", clean_domain);
                 false
             }
         }
@@ -721,7 +721,7 @@ impl DnsServer {
                     match first_ipv6 {
                         Some(IpAddr::V6(ipv6)) => {
                             if is_ipv6_polluted(&ipv6) {
-                                info!(
+                                debug!(
                                     "[DOMESTIC-POLLUTED-AAAA] {} ({}) -> foreign",
                                     clean_domain, ipv6
                                 );
@@ -737,17 +737,17 @@ impl DnsServer {
                             true
                         }
                         None => {
-                            info!("[DOMESTIC-NO-IP-AAAA] {} -> foreign", clean_domain);
+                            debug!("[DOMESTIC-NO-IP-AAAA] {} -> foreign", clean_domain);
                             false
                         }
                     }
                 } else {
-                    info!("[DOMESTIC-PARSE-ERR-AAAA] {} -> foreign", clean_domain);
+                    debug!("[DOMESTIC-PARSE-ERR-AAAA] {} -> foreign", clean_domain);
                     false
                 }
             }
             None => {
-                error!("[DOMESTIC-TIMEOUT-AAAA] {} -> foreign", clean_domain);
+                debug!("[DOMESTIC-TIMEOUT-AAAA] {} -> foreign", clean_domain);
                 false
             }
         }
@@ -856,13 +856,13 @@ impl DnsServer {
                         chosen_tag, clean_domain, chosen_upstream, ip
                     );
                 } else {
-                    error!(
+                    warn!(
                         "[{}] {} -> {} (no A/AAAA answer)",
                         chosen_tag, clean_domain, chosen_upstream
                     );
                 }
             } else {
-                error!(
+                warn!(
                     "[{}] {} -> {} (no A/AAAA answer)",
                     chosen_tag, clean_domain, chosen_upstream
                 );
@@ -947,7 +947,7 @@ impl DnsServer {
         }
 
         let Some(effective_ttl) = response_cache_ttl(&msg) else {
-            tracing::debug!("[{}] {} ttl=0", skip_tag, domain);
+            debug!("[{}] {} ttl=0", skip_tag, domain);
             return;
         };
 
@@ -974,7 +974,7 @@ impl DnsServer {
             Some(resp) => resp,
             None => {
                 if let Some((tag, domain)) = timeout_log {
-                    error!("[{}] {} -> SERVFAIL", tag, domain);
+                    warn!("[{}] {} -> SERVFAIL", tag, domain);
                 }
 
                 build_servfail_response(query)
@@ -1025,7 +1025,7 @@ impl DnsServer {
             let _ = self.socket.send_to(&servfail, src).await;
 
             let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
-            info!(
+            debug!(
                 "[DONE] {} multi-query -> SERVFAIL, cost={:.3}ms",
                 src, elapsed_ms
             );
@@ -1063,7 +1063,7 @@ impl DnsServer {
 
             _ => {
                 // 非 A / AAAA 查询直接给国内上游
-                tracing::debug!("[NON-A] {} type={:?} -> domestic", clean_domain, qtype);
+                debug!("[NON-A] {} type={:?} -> domestic", clean_domain, qtype);
 
                 let _ = self
                     .forward_to_upstream(&request, &query_msg, &self.domestic_upstream, &src)
@@ -1073,7 +1073,7 @@ impl DnsServer {
 
         let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
 
-        info!(
+        debug!(
             "[DONE] {} type={:?} from={} cost={:.3}ms",
             clean_domain, qtype, src, elapsed_ms
         );
@@ -1098,11 +1098,11 @@ impl DnsServer {
         match tokio::time::timeout(self.timeout, socket.recv_from(&mut buf)).await {
             Ok(Ok((len, _))) => Some(buf[..len].to_vec()),
             Ok(Err(e)) => {
-                error!("recv error from {}: {}", upstream, e);
+                warn!("recv error from {}: {}", upstream, e);
                 None
             }
             Err(_) => {
-                error!("Timeout waiting for response from {}", upstream);
+                warn!("Timeout waiting for response from {}", upstream);
                 None
             }
         }
@@ -1147,11 +1147,12 @@ async fn main() -> anyhow::Result<()> {
 
     let config: Config = toml::from_str(&config_str).expect("Invalid config.toml");
 
-    let env_filter = if let Some(ref level) = config.log_level {
-        tracing_subscriber::EnvFilter::new(level)
-    } else {
-        tracing_subscriber::EnvFilter::from_default_env()
-    };
+    let base = config
+        .log_level
+        .as_deref()
+        .unwrap_or("info,tsubamegaeshi_rs=debug");
+
+    let env_filter = tracing_subscriber::EnvFilter::new(format!("{},maxminddb=warn", base));
 
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
@@ -1252,10 +1253,7 @@ async fn main() -> anyhow::Result<()> {
                         pattern: d.to_ascii_lowercase(),
                     })
                     .collect();
-                MarkGroup {
-                    nft_table,
-                    rules,
-                }
+                MarkGroup { nft_table, rules }
             })
             .collect();
         MarkSites { groups }
@@ -1275,7 +1273,9 @@ async fn main() -> anyhow::Result<()> {
     let nft_manager = mark_sites.as_ref().map(|_| Arc::new(CommandNftManager));
 
     // 初始化 nft 表与集合
-    if let Some(ref ms) = mark_sites && let Some(ref nft) = nft_manager {
+    if let Some(ref ms) = mark_sites
+        && let Some(ref nft) = nft_manager
+    {
         for group in &ms.groups {
             nft.ensure_table(&group.nft_table);
         }
@@ -1318,6 +1318,7 @@ const NFT_TABLE_PREFIX: &str = "tsubamegaeshi_";
 pub struct CommandNftManager;
 
 impl CommandNftManager {
+    #[rustfmt::skip]
     pub fn ensure_table(&self, table: &str) {
         let _ = Command::new("/usr/sbin/nft")
             .args(["add", "table", "inet", table])
