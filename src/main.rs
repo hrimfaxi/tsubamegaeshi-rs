@@ -127,7 +127,7 @@ struct Config {
     special_upstream: String,
     domestic_upstream: String,
     foreign_upstream: String,
-    geoip_db: String,
+    mmdb_path: String,
     cache_size: usize,
     query_timeout_sec: u64,
     enable_ipv6_aaaa: bool,
@@ -157,7 +157,7 @@ struct DnsServer {
     special_upstream: SocketAddr,
     domestic_upstream: SocketAddr,
     foreign_upstream: SocketAddr,
-    geoip: Reader<Vec<u8>>,
+    mmdb: Reader<Vec<u8>>,
     special_suffixes: Vec<String>,
     cache: Option<tokio::sync::Mutex<lru::LruCache<(String, u16), CacheEntry>>>,
     timeout: Duration,
@@ -1031,7 +1031,7 @@ impl DnsServer {
     }
 
     fn is_china_ip(&self, ip: IpAddr) -> bool {
-        let city: City = match self.geoip.lookup(ip) {
+        let city: City = match self.mmdb.lookup(ip) {
             Ok(city) => city,
             Err(_) => return false,
         };
@@ -1065,12 +1065,12 @@ async fn main() -> anyhow::Result<()> {
         .without_time()
         .init();
 
-    // 加载 GeoIP
-    let geoip_data = tokio::fs::read(&config.geoip_db)
+    // 加载 mmdb
+    let mmdb_data = tokio::fs::read(&config.mmdb_path)
         .await
-        .expect("Failed to read GeoIP database");
+        .expect("Failed to read MMDB database");
 
-    let geoip = Reader::from_source(geoip_data).expect("Invalid GeoIP database");
+    let mmdb = Reader::from_source(mmdb_data).expect("Invalid MMDB database");
 
     // 加载 GFWList 并构建布隆过滤器
     let gfw_checker = if let Some(path) = &config.gfwlist_path {
@@ -1152,7 +1152,7 @@ async fn main() -> anyhow::Result<()> {
         special_upstream,
         domestic_upstream,
         foreign_upstream,
-        geoip,
+        mmdb,
         special_suffixes: config.special_suffixes,
         cache,
         timeout: Duration::from_secs(config.query_timeout_sec),
