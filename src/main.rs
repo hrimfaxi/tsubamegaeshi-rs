@@ -433,6 +433,23 @@ impl DnsServer {
         };
         let Some(nft) = &self.nft_manager else { return };
 
+        // 1. 先快速检查是否有匹配的 nft 组
+        let matched_groups: Vec<&MarkGroup> = mark_sites.match_groups(clean_domain).collect();
+        if matched_groups.is_empty() {
+            return;
+        }
+
+        info!(
+            "[MARK_SITES] domain '{}' matched {} group(s): {:?}",
+            clean_domain,
+            matched_groups.len(),
+            matched_groups
+                .iter()
+                .map(|g| &g.nft_table)
+                .collect::<Vec<_>>()
+        );
+
+        // 2. 只有确认需要标记时，才提取 IP（并去重）
         let ips: Vec<IpAddr> = match Message::from_vec(final_resp) {
             Ok(msg) => msg
                 .answers()
@@ -444,18 +461,13 @@ impl DnsServer {
                         None
                     }
                 })
-                .collect::<HashSet<_>>() // 去重
+                .collect::<HashSet<_>>()
                 .into_iter()
                 .collect(),
             Err(_) => vec![],
         };
 
         if ips.is_empty() {
-            return;
-        }
-
-        let matched_groups: Vec<&MarkGroup> = mark_sites.match_groups(clean_domain).collect();
-        if matched_groups.is_empty() {
             return;
         }
 
@@ -469,14 +481,10 @@ impl DnsServer {
             }
         }
 
-        if entries.is_empty() {
-            return;
-        }
-
         // 异步获取许可，限制并发
         let permit = NFT_SEM.acquire().await;
         tokio::task::spawn_blocking(move || {
-            let _permit = permit; // 保持许可直到任务结束
+            let _permit = permit;
             for (table, ip) in entries {
                 if let Err(e) = nft_manager.as_ref().add_ip_to_group(&table, ip) {
                     error!(
