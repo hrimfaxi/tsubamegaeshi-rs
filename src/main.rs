@@ -12,8 +12,10 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -145,6 +147,8 @@ struct Config {
 
     #[serde(default)]
     hosts: Option<HostsTables>,
+    #[serde(default)]
+    marksite: Option<HashMap<String, Vec<String>>>,
 }
 
 struct CacheEntry {
@@ -167,6 +171,8 @@ struct DnsServer {
     force_domestic: Option<Vec<String>>,
     hosts_v4: Option<HashMap<String, Ipv4Addr>>,
     hosts_v6: Option<HashMap<String, Ipv6Addr>>,
+    mark_sites: Option<MarkSites>,
+    nft_manager: Option<Arc<CommandNftManager>>,
 }
 
 /// 域名后缀匹配。
@@ -417,6 +423,65 @@ fn print_first_ip(resp: &[u8], tag: &str, domain: &str, upstream: &str) {
 }
 
 impl DnsServer {
+    /// 根据最终应答和域名，将解析出的 IP 异步添加到匹配的 nft 表中。
+    fn apply_mark_sites(&self, final_resp: &[u8], clean_domain: &str) {
+        let Some(mark_sites) = &self.mark_sites else {
+            return;
+        };
+        let Some(nft) = &self.nft_manager else { return };
+
+        let ips: Vec<IpAddr> = match Message::from_vec(final_resp) {
+            Ok(msg) => msg
+                .answers()
+                .iter()
+                .filter_map(|rr| {
+                    if rr.record_type() == RecordType::A || rr.record_type() == RecordType::AAAA {
+                        rr.data().and_then(|d| d.ip_addr())
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            Err(_) => vec![],
+        };
+
+        if ips.is_empty() {
+            return;
+        }
+
+        let matched_groups: Vec<&MarkGroup> = mark_sites.match_groups(clean_domain).collect();
+        if matched_groups.is_empty() {
+            return;
+        }
+
+        let nft_manager = nft.clone();
+        let tables: Vec<String> = matched_groups.iter().map(|g| g.nft_table.clone()).collect();
+
+        let mut entries = Vec::new();
+        for ip in &ips {
+            for table in &tables {
+                entries.push((table.clone(), *ip));
+            }
+        }
+
+        if entries.is_empty() {
+            return;
+        }
+
+        tokio::task::spawn_blocking(move || {
+            for (table, ip) in entries {
+                if let Err(e) = nft_manager.as_ref().add_ip_to_group(&table, ip) {
+                    error!(
+                        "[mark_sites] Failed to add {} to table {}: {}",
+                        ip, table, e
+                    );
+                } else {
+                    info!("[mark_sites] Added {} to table {}", ip, table);
+                }
+            }
+        });
+    }
+
     async fn handle_hosts_override(
         &self,
         kind: AddressQueryKind,
@@ -430,6 +495,7 @@ impl DnsServer {
                     let resp = build_a_response(query_msg, *ip, 60);
                     info!("[HOSTS-A] {} -> {}", clean_domain, ip);
                     let _ = self.socket.send_to(&resp, src).await;
+                    self.apply_mark_sites(&resp, clean_domain);
                     return true;
                 }
                 // 检查是否仅存在于 v6 表中
@@ -450,6 +516,7 @@ impl DnsServer {
                     let resp = build_aaaa_response(query_msg, *ip, 60);
                     info!("[HOSTS-AAAA] {} -> {}", clean_domain, ip);
                     let _ = self.socket.send_to(&resp, src).await;
+                    self.apply_mark_sites(&resp, clean_domain);
                     return true;
                 }
                 if self
@@ -505,6 +572,7 @@ impl DnsServer {
                     clean_domain,
                     &self.special_upstream.to_string(),
                 );
+                self.apply_mark_sites(&resp, clean_domain);
                 return true;
             }
         }
@@ -528,6 +596,7 @@ impl DnsServer {
                 clean_domain,
                 &self.domestic_upstream.to_string(),
             );
+            self.apply_mark_sites(&resp, clean_domain);
             return true;
         }
 
@@ -550,6 +619,7 @@ impl DnsServer {
                 clean_domain,
                 &self.foreign_upstream.to_string(),
             );
+            self.apply_mark_sites(&resp, clean_domain);
             return true;
         }
 
@@ -572,6 +642,7 @@ impl DnsServer {
                     clean_domain,
                     &self.foreign_upstream.to_string(),
                 );
+                self.apply_mark_sites(&resp, clean_domain);
                 return true;
             }
         }
@@ -808,6 +879,7 @@ impl DnsServer {
         .await;
 
         let _ = self.socket.send_to(&final_resp, src).await;
+        self.apply_mark_sites(&final_resp, clean_domain);
     }
 
     async fn send_cached_response(
@@ -857,6 +929,7 @@ impl DnsServer {
         rewrite_dns_id(&mut data, req_id);
 
         let _ = self.socket.send_to(&data, src).await;
+        self.apply_mark_sites(&data, domain);
         true
     }
 
@@ -1168,6 +1241,46 @@ async fn main() -> anyhow::Result<()> {
         (v4, v6)
     });
 
+    let mark_sites = config.marksite.as_ref().map(|map| {
+        let groups: Vec<MarkGroup> = map
+            .iter()
+            .map(|(table, domains)| {
+                let nft_table = format!("{}{}", NFT_TABLE_PREFIX, table);
+                let rules: Vec<MarkRule> = domains
+                    .iter()
+                    .map(|d| MarkRule {
+                        pattern: d.to_ascii_lowercase(),
+                    })
+                    .collect();
+                MarkGroup {
+                    nft_table,
+                    rules,
+                }
+            })
+            .collect();
+        MarkSites { groups }
+    });
+
+    // 打印每个表的规则数量
+    if let Some(ref ms) = mark_sites {
+        for group in &ms.groups {
+            info!(
+                "marksite table '{}' loaded with {} rules",
+                group.nft_table,
+                group.rules.len()
+            );
+        }
+    }
+
+    let nft_manager = mark_sites.as_ref().map(|_| Arc::new(CommandNftManager));
+
+    // 初始化 nft 表与集合
+    if let Some(ref ms) = mark_sites && let Some(ref nft) = nft_manager {
+        for group in &ms.groups {
+            nft.ensure_table(&group.nft_table);
+        }
+    }
+
     let server = Arc::new(DnsServer {
         socket,
         special_upstream,
@@ -1183,6 +1296,8 @@ async fn main() -> anyhow::Result<()> {
         force_domestic: config.force_domestic_domains,
         hosts_v4,
         hosts_v6,
+        mark_sites,
+        nft_manager,
     });
 
     info!("tsubamegaeshi-rs started on {}", config.listen);
@@ -1190,4 +1305,90 @@ async fn main() -> anyhow::Result<()> {
     server.run().await;
 
     Ok(())
+}
+
+// ----- NftManager trait and Command implementation -----
+
+pub trait NftManager: Send + Sync {
+    fn add_ip_to_group(&self, table: &str, addr: IpAddr) -> io::Result<()>;
+}
+
+const NFT_TABLE_PREFIX: &str = "tsubamegaeshi_";
+
+pub struct CommandNftManager;
+
+impl CommandNftManager {
+    pub fn ensure_table(&self, table: &str) {
+        let _ = Command::new("/usr/sbin/nft")
+            .args(["add", "table", "inet", table])
+            .status();
+
+        let _ = Command::new("/usr/sbin/nft")
+            .args([
+                "add", "set", "inet", table, "spam_ips",
+                "{", "type", "ipv4_addr;", "timeout", "1h;", "flags", "timeout,dynamic;", "}",
+            ])
+            .status();
+
+        let _ = Command::new("/usr/sbin/nft")
+            .args([
+                "add", "set", "inet", table, "spam_ips6",
+                "{", "type", "ipv6_addr;", "timeout", "1h;", "flags", "timeout,dynamic;", "}",
+            ])
+            .status();
+    }
+}
+
+impl NftManager for CommandNftManager {
+    fn add_ip_to_group(&self, table: &str, addr: IpAddr) -> io::Result<()> {
+        let set_name = match addr {
+            IpAddr::V4(_) => "spam_ips",
+            IpAddr::V6(_) => "spam_ips6",
+        };
+
+        let elem = format!("{{ {} }}", addr);
+
+        let status = Command::new("/usr/sbin/nft")
+            .args(["add", "element", "inet", table, set_name, &elem])
+            .status()?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "nft add element failed: table={table}, set={set_name}, addr={addr}"
+            )))
+        }
+    }
+}
+
+// ----- MarkSites -----
+
+#[derive(Debug)]
+struct MarkRule {
+    pattern: String,
+}
+
+#[derive(Debug)]
+struct MarkGroup {
+    nft_table: String,
+    rules: Vec<MarkRule>,
+}
+
+#[derive(Debug)]
+struct MarkSites {
+    groups: Vec<MarkGroup>,
+}
+
+impl MarkSites {
+    pub fn match_groups(&self, domain: &str) -> impl Iterator<Item = &MarkGroup> {
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+
+        self.groups.iter().filter(move |group| {
+            group.rules.iter().any(|rule| {
+                // 子串匹配：domain 中包含 rule.pattern 即命中
+                domain.contains(&rule.pattern)
+            })
+        })
+    }
 }

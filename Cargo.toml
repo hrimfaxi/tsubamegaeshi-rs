@@ -1,7 +1,7 @@
 [package]
 name = "tsubamegaeshi-rs"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "燕返 — Lightweight dual-rail DNS splitter with IP-based geo decisions, caching, and Xray integration"
 license = "MIT OR Apache-2.0"
 
