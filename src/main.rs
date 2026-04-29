@@ -3,6 +3,7 @@ use bloomfilter::Bloom;
 use clap::Parser;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::rdata::A as ARecord;
+use hickory_proto::rr::rdata::AAAA as AAAARecord;
 use hickory_proto::rr::{RData, Record, RecordType};
 use maxminddb::geoip2::City;
 use maxminddb::Reader;
@@ -11,8 +12,8 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
-use std::net::Ipv4Addr;
 use std::net::{IpAddr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -111,6 +112,14 @@ struct Cli {
     config: String,
 }
 
+#[derive(Deserialize, Default)]
+struct HostsTables {
+    #[serde(default)]
+    ipv4: Option<HashMap<String, String>>,
+    #[serde(default)]
+    ipv6: Option<HashMap<String, String>>,
+}
+
 #[derive(Deserialize)]
 struct Config {
     listen: String,
@@ -135,7 +144,7 @@ struct Config {
     force_domestic_domains: Option<Vec<String>>,
 
     #[serde(default)]
-    hosts: Option<HashMap<String, String>>,
+    hosts: Option<HostsTables>,
 }
 
 struct CacheEntry {
@@ -156,7 +165,8 @@ struct DnsServer {
     gfw_checker: Option<BloomDomainChecker>,
     force_foreign: Option<Vec<String>>,
     force_domestic: Option<Vec<String>>,
-    hosts: Option<HashMap<String, String>>,
+    hosts_v4: Option<HashMap<String, Ipv4Addr>>,
+    hosts_v6: Option<HashMap<String, Ipv6Addr>>,
 }
 
 /// 域名后缀匹配。
@@ -342,6 +352,23 @@ fn build_a_response(query: &Message, ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
     resp.to_vec().unwrap_or_default()
 }
 
+fn build_aaaa_response(query: &Message, ip: Ipv6Addr, ttl: u32) -> Vec<u8> {
+    let mut resp = build_basic_response_message(query, ResponseCode::NoError);
+
+    let Some(q) = query.queries().first() else {
+        return build_servfail_response(query);
+    };
+
+    let mut answer = Record::new();
+    answer.set_name(q.name().clone());
+    answer.set_record_type(RecordType::AAAA);
+    answer.set_ttl(ttl);
+    answer.set_data(Some(RData::AAAA(AAAARecord(ip))));
+
+    resp.add_answer(answer);
+    resp.to_vec().unwrap_or_default()
+}
+
 fn response_cache_ttl(msg: &Message) -> Option<u64> {
     let min_ttl = msg.answers().iter().map(|rr| rr.ttl()).min()?;
 
@@ -397,41 +424,45 @@ impl DnsServer {
         clean_domain: &str,
         src: SocketAddr,
     ) -> bool {
-        let Some(hosts) = &self.hosts else {
-            return false;
-        };
-
         match kind {
             AddressQueryKind::A => {
-                let Some(ip_str) = hosts.get(clean_domain) else {
-                    return false;
-                };
-
-                let Ok(ip) = Ipv4Addr::from_str(ip_str) else {
-                    return false;
-                };
-
-                let resp_bytes = build_a_response(query_msg, ip, 60);
-
-                info!("[HOSTS] {} -> {}", clean_domain, ip);
-
-                let _ = self.socket.send_to(&resp_bytes, src).await;
-                true
-            }
-
-            AddressQueryKind::Aaaa => {
-                if !hosts.contains_key(clean_domain) {
-                    return false;
+                if let Some(ip) = self.hosts_v4.as_ref().and_then(|h| h.get(clean_domain)) {
+                    let resp = build_a_response(query_msg, *ip, 60);
+                    info!("[HOSTS-A] {} -> {}", clean_domain, ip);
+                    let _ = self.socket.send_to(&resp, src).await;
+                    return true;
                 }
-
-                info!(
-                    "[HOSTS-NO-AAAA] {} in hosts, returning NODATA",
-                    clean_domain
-                );
-
-                let nodata = build_nodata_response(query_msg);
-                let _ = self.socket.send_to(&nodata, src).await;
-                true
+                // 检查是否仅存在于 v6 表中
+                if self
+                    .hosts_v6
+                    .as_ref()
+                    .map_or(false, |h| h.contains_key(clean_domain))
+                {
+                    info!("[HOSTS-NO-A] {} (v6 only)", clean_domain);
+                    let nodata = build_nodata_response(query_msg);
+                    let _ = self.socket.send_to(&nodata, src).await;
+                    return true;
+                }
+                false
+            }
+            AddressQueryKind::Aaaa => {
+                if let Some(ip) = self.hosts_v6.as_ref().and_then(|h| h.get(clean_domain)) {
+                    let resp = build_aaaa_response(query_msg, *ip, 60);
+                    info!("[HOSTS-AAAA] {} -> {}", clean_domain, ip);
+                    let _ = self.socket.send_to(&resp, src).await;
+                    return true;
+                }
+                if self
+                    .hosts_v4
+                    .as_ref()
+                    .map_or(false, |h| h.contains_key(clean_domain))
+                {
+                    info!("[HOSTS-NO-AAAA] {} (v4 only)", clean_domain);
+                    let nodata = build_nodata_response(query_msg);
+                    let _ = self.socket.send_to(&nodata, src).await;
+                    return true;
+                }
+                false
             }
         }
     }
@@ -1097,6 +1128,25 @@ async fn main() -> anyhow::Result<()> {
     let cache = std::num::NonZeroUsize::new(config.cache_size)
         .map(|size| tokio::sync::Mutex::new(lru::LruCache::new(size)));
 
+    fn parse_hosts<A: FromStr<Err = std::net::AddrParseError>>(
+        map: &HashMap<String, String>,
+    ) -> HashMap<String, A> {
+        map.iter()
+            .map(|(k, v)| {
+                let addr = v
+                    .parse::<A>()
+                    .unwrap_or_else(|e| panic!("invalid IP for {k}: {e}"));
+                (k.clone(), addr)
+            })
+            .collect()
+    }
+
+    let (hosts_v4, hosts_v6) = config.hosts.as_ref().map_or((None, None), |h| {
+        let v4 = h.ipv4.as_ref().map(|m| parse_hosts::<Ipv4Addr>(m));
+        let v6 = h.ipv6.as_ref().map(|m| parse_hosts::<Ipv6Addr>(m));
+        (v4, v6)
+    });
+
     let server = Arc::new(DnsServer {
         socket,
         special_upstream,
@@ -1110,7 +1160,8 @@ async fn main() -> anyhow::Result<()> {
         gfw_checker,
         force_foreign: config.force_foreign_domains,
         force_domestic: config.force_domestic_domains,
-        hosts: config.hosts,
+        hosts_v4,
+        hosts_v6,
     });
 
     info!("tsubamegaeshi-rs started on {}", config.listen);
