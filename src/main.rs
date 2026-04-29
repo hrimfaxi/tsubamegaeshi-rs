@@ -725,7 +725,7 @@ impl DnsServer {
         let use_domestic = self.should_use_domestic_response(kind, clean_domain, &domestic_resp);
 
         let (final_resp, chosen_tag, chosen_upstream) = if use_domestic {
-            let resp = domestic_resp.unwrap();
+            let resp = domestic_resp.expect("domestic_rep must be Some");
             (
                 resp,
                 kind.domestic_tag(),
@@ -1094,13 +1094,8 @@ async fn main() -> anyhow::Result<()> {
     let domestic_upstream: SocketAddr = config.domestic_upstream.parse()?;
     let foreign_upstream: SocketAddr = config.foreign_upstream.parse()?;
 
-    let cache = if config.cache_size > 0 {
-        Some(tokio::sync::Mutex::new(lru::LruCache::new(
-            config.cache_size.try_into().unwrap(),
-        )))
-    } else {
-        None
-    };
+    let cache = std::num::NonZeroUsize::new(config.cache_size)
+        .map(|size| tokio::sync::Mutex::new(lru::LruCache::new(size)));
 
     let server = Arc::new(DnsServer {
         socket,
