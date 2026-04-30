@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use bloomfilter::Bloom;
 use clap::Parser;
 use hickory_proto::op::{Message, MessageType, ResponseCode};
@@ -9,22 +11,18 @@ use maxminddb::Reader;
 use maxminddb::geoip2::City;
 use serde::Deserialize;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info, trace, warn};
-
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_AAAA: u16 = 28;
@@ -121,6 +119,7 @@ struct Cli {
 struct HostsTables {
     #[serde(default)]
     ipv4: Option<HashMap<String, String>>,
+
     #[serde(default)]
     ipv6: Option<HashMap<String, String>>,
 }
@@ -140,7 +139,7 @@ struct Config {
 
     // GFWList 相关配置
     gfwlist_path: Option<String>,
-    gfbloom_fp_rate: Option<f64>, // 默认 0.001 (0.1%)
+    gfbloom_fp_rate: Option<f64>,
 
     #[serde(default)]
     force_foreign_domains: Option<Vec<String>>,
@@ -150,6 +149,7 @@ struct Config {
 
     #[serde(default)]
     hosts: Option<HostsTables>,
+
     #[serde(default)]
     marksite: Option<HashMap<String, Vec<String>>>,
 }
@@ -159,6 +159,76 @@ struct CacheEntry {
     expire: Instant,
 }
 
+struct DnsCache {
+    inner: Mutex<lru::LruCache<(String, u16), CacheEntry>>,
+}
+
+impl DnsCache {
+    fn new(size: NonZeroUsize) -> Self {
+        Self {
+            inner: Mutex::new(lru::LruCache::new(size)),
+        }
+    }
+
+    async fn get_response(&self, domain: &str, qtype_num: u16, req_id: u16) -> Option<Vec<u8>> {
+        let key = (domain.to_string(), qtype_num);
+
+        let cached_data = {
+            let mut cache = self.inner.lock().await;
+            let now = Instant::now();
+
+            let mut expired = false;
+
+            let data = if let Some(entry) = cache.get(&key) {
+                if entry.expire > now {
+                    Some(entry.data.clone())
+                } else {
+                    expired = true;
+                    None
+                }
+            } else {
+                None
+            };
+
+            if expired {
+                cache.pop(&key);
+            }
+
+            data
+        };
+
+        let mut data = cached_data?;
+        rewrite_dns_id(&mut data, req_id);
+        Some(data)
+    }
+
+    async fn put_response(&self, domain: &str, qtype_num: u16, response: &[u8], skip_tag: &str) {
+        let Ok(msg) = Message::from_vec(response) else {
+            return;
+        };
+
+        if msg.response_code() != ResponseCode::NoError || msg.answers().is_empty() {
+            return;
+        }
+
+        let Some(effective_ttl) = response_cache_ttl(&msg) else {
+            debug!("[{}] {} ttl=0", skip_tag, domain);
+            return;
+        };
+
+        let expire = Instant::now() + Duration::from_secs(effective_ttl);
+
+        let mut cache = self.inner.lock().await;
+        cache.put(
+            (domain.to_string(), qtype_num),
+            CacheEntry {
+                data: response.to_vec(),
+                expire,
+            },
+        );
+    }
+}
+
 struct DnsServer {
     socket: UdpSocket,
     special_upstream: SocketAddr,
@@ -166,7 +236,7 @@ struct DnsServer {
     foreign_upstream: SocketAddr,
     mmdb: Reader<Vec<u8>>,
     special_suffixes: Vec<String>,
-    cache: Option<tokio::sync::Mutex<lru::LruCache<(String, u16), CacheEntry>>>,
+    cache: Option<DnsCache>,
     timeout: Duration,
     enable_ipv6_aaaa: bool,
     gfw_checker: Option<BloomDomainChecker>,
@@ -178,8 +248,30 @@ struct DnsServer {
     nft_manager: Option<Arc<CommandNftManager>>,
 }
 
+struct RequestContext<'a> {
+    kind: AddressQueryKind,
+    request: &'a [u8],
+    query_msg: &'a Message,
+    clean_domain: &'a str,
+    src: SocketAddr,
+}
+
 fn canonical_domain(domain: &str) -> String {
-    domain.to_ascii_lowercase()
+    domain
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn normalize_domain_list(items: Option<Vec<String>>) -> Option<Vec<String>> {
+    let items: Vec<String> = items
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| canonical_domain(&s))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if items.is_empty() { None } else { Some(items) }
 }
 
 /// 域名后缀匹配。
@@ -191,26 +283,25 @@ fn canonical_domain(domain: &str) -> String {
 /// 不匹配：
 /// - `badexample.com` 不应匹配 `example.com`
 fn domain_matches_suffix(domain: &str, suffix: &str) -> bool {
-    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-    let suffix = suffix
-        .trim_start_matches('.')
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    let domain = canonical_domain(domain);
+    let suffix = canonical_domain(suffix);
+
+    if suffix.is_empty() {
+        return false;
+    }
 
     domain == suffix || domain.ends_with(&format!(".{}", suffix))
 }
 
 /// 检查域名是否匹配强制列表中的任一条目。
 fn is_forced(domain: &str, list: &Option<Vec<String>>) -> bool {
-    if let Some(items) = list {
-        for pattern in items {
-            if domain_matches_suffix(domain, pattern) {
-                return true;
-            }
-        }
-    }
+    let Some(items) = list else {
+        return false;
+    };
 
-    false
+    items
+        .iter()
+        .any(|pattern| domain_matches_suffix(domain, pattern))
 }
 
 /// GFWList 解码器：负责读取、解码、解析规则并提取域名
@@ -263,7 +354,7 @@ impl GfwlistDecoder {
                     .next()
                     .unwrap_or(rest);
 
-                let domain = domain.trim_end_matches('^').to_lowercase();
+                let domain = canonical_domain(domain.trim_end_matches('^'));
 
                 if !domain.is_empty() && !domain.contains('*') {
                     debug!("gfwlist domain: {}", domain);
@@ -294,6 +385,7 @@ impl BloomDomainChecker {
             .map_err(|e| anyhow::anyhow!("创建布隆过滤器失败: {}", e))?;
 
         for domain in domains {
+            let domain = canonical_domain(domain);
             filter.set(&domain.as_bytes().to_vec());
         }
 
@@ -301,15 +393,20 @@ impl BloomDomainChecker {
     }
 
     pub fn check(&self, domain: &str) -> bool {
+        let domain = canonical_domain(domain);
         let mut parts: Vec<&str> = domain.split('.').collect();
-        // 至少保留 2 段（例如 google.com）
+
+        // 至少保留 2 段，例如 google.com
         while parts.len() >= 2 {
             let key = parts.join(".");
-            if self.filter.check(&key.to_lowercase().as_bytes().to_vec()) {
+            if self.filter.check(&key.as_bytes().to_vec()) {
                 return true;
             }
-            parts.remove(0); // 去掉最左侧子域名
+
+            // 去掉最左侧子域名
+            parts.remove(0);
         }
+
         false
     }
 }
@@ -401,7 +498,7 @@ fn rewrite_dns_id(data: &mut [u8], id: u16) {
 }
 
 /// 检测 IPv6 地址是否为已知 GFW 污染地址，例如 `2001::xxxx:yyyy`
-fn is_ipv6_polluted(ip: &std::net::Ipv6Addr) -> bool {
+fn is_ipv6_polluted(ip: &Ipv6Addr) -> bool {
     let bytes = ip.octets();
 
     // 前缀必须是 2001
@@ -426,7 +523,15 @@ fn print_first_ip(resp: &[u8], tag: &str, domain: &str, upstream: &str) {
             }
         }
     }
+
     warn!("[{}] {} -> {} (no A/AAAA answer)", tag, domain, upstream);
+}
+
+async fn bind_ephemeral_udp_for(upstream: &SocketAddr) -> io::Result<UdpSocket> {
+    match upstream {
+        SocketAddr::V4(_) => UdpSocket::bind("0.0.0.0:0").await,
+        SocketAddr::V6(_) => UdpSocket::bind("[::]:0").await,
+    }
 }
 
 impl DnsServer {
@@ -435,10 +540,14 @@ impl DnsServer {
         let Some(mark_sites) = &self.mark_sites else {
             return;
         };
-        let Some(nft) = &self.nft_manager else { return };
+
+        let Some(nft) = &self.nft_manager else {
+            return;
+        };
 
         // 1. 先快速检查是否有匹配的 nft 组
         let matched_groups: Vec<&MarkGroup> = mark_sites.match_groups(clean_domain).collect();
+
         if matched_groups.is_empty() {
             return;
         }
@@ -453,7 +562,7 @@ impl DnsServer {
                 .collect::<Vec<_>>()
         );
 
-        // 2. 只有确认需要标记时，才提取 IP（并去重）
+        // 2. 只有确认需要标记时，才提取 IP，并去重
         let ips: Vec<IpAddr> = match Message::from_vec(final_resp) {
             Ok(msg) => msg
                 .answers()
@@ -479,16 +588,21 @@ impl DnsServer {
         let tables: Vec<String> = matched_groups.iter().map(|g| g.nft_table.clone()).collect();
 
         let mut entries = Vec::new();
+
         for ip in &ips {
             for table in &tables {
                 entries.push((table.clone(), *ip));
             }
         }
 
-        // 异步获取许可，限制并发
-        let permit = NFT_SEM.acquire().await;
+        let Ok(permit) = NFT_SEM.acquire().await else {
+            warn!("[mark_sites] failed to acquire nft semaphore");
+            return;
+        };
+
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+
             for (table, ip) in entries {
                 if let Err(e) = nft_manager.as_ref().add_ip_to_group(&table, ip) {
                     error!(
@@ -502,53 +616,60 @@ impl DnsServer {
         });
     }
 
-    async fn handle_hosts_override(
-        &self,
-        kind: AddressQueryKind,
-        query_msg: &Message,
-        clean_domain: &str,
-        src: SocketAddr,
-    ) -> bool {
-        match kind {
+    async fn handle_hosts_override(&self, ctx: &RequestContext<'_>) -> bool {
+        match ctx.kind {
             AddressQueryKind::A => {
-                if let Some(ip) = self.hosts_v4.as_ref().and_then(|h| h.get(clean_domain)) {
-                    let resp = build_a_response(query_msg, *ip, 60);
-                    info!("[HOSTS-A] {} -> {}", clean_domain, ip);
-                    let _ = self.socket.send_to(&resp, src).await;
-                    // self.apply_mark_sites(&resp, clean_domain).await;
+                if let Some(ip) = self.hosts_v4.as_ref().and_then(|h| h.get(ctx.clean_domain)) {
+                    let resp = build_a_response(ctx.query_msg, *ip, 60);
+
+                    info!("[HOSTS-A] {} -> {}", ctx.clean_domain, ip);
+
+                    let _ = self.socket.send_to(&resp, ctx.src).await;
+
                     return true;
                 }
+
                 // 检查是否仅存在于 v6 表中
                 if self
                     .hosts_v6
                     .as_ref()
-                    .map_or(false, |h| h.contains_key(clean_domain))
+                    .map_or(false, |h| h.contains_key(ctx.clean_domain))
                 {
-                    info!("[HOSTS-NO-A] {} (v6 only)", clean_domain);
-                    let nodata = build_nodata_response(query_msg);
-                    let _ = self.socket.send_to(&nodata, src).await;
+                    info!("[HOSTS-NO-A] {} (v6 only)", ctx.clean_domain);
+
+                    let nodata = build_nodata_response(ctx.query_msg);
+                    let _ = self.socket.send_to(&nodata, ctx.src).await;
+
                     return true;
                 }
+
                 false
             }
+
             AddressQueryKind::Aaaa => {
-                if let Some(ip) = self.hosts_v6.as_ref().and_then(|h| h.get(clean_domain)) {
-                    let resp = build_aaaa_response(query_msg, *ip, 60);
-                    info!("[HOSTS-AAAA] {} -> {}", clean_domain, ip);
-                    let _ = self.socket.send_to(&resp, src).await;
-                    // self.apply_mark_sites(&resp, clean_domain).await;
+                if let Some(ip) = self.hosts_v6.as_ref().and_then(|h| h.get(ctx.clean_domain)) {
+                    let resp = build_aaaa_response(ctx.query_msg, *ip, 60);
+
+                    info!("[HOSTS-AAAA] {} -> {}", ctx.clean_domain, ip);
+
+                    let _ = self.socket.send_to(&resp, ctx.src).await;
+
                     return true;
                 }
+
                 if self
                     .hosts_v4
                     .as_ref()
-                    .map_or(false, |h| h.contains_key(clean_domain))
+                    .map_or(false, |h| h.contains_key(ctx.clean_domain))
                 {
-                    info!("[HOSTS-NO-AAAA] {} (v4 only)", clean_domain);
-                    let nodata = build_nodata_response(query_msg);
-                    let _ = self.socket.send_to(&nodata, src).await;
+                    info!("[HOSTS-NO-AAAA] {} (v4 only)", ctx.clean_domain);
+
+                    let nodata = build_nodata_response(ctx.query_msg);
+                    let _ = self.socket.send_to(&nodata, ctx.src).await;
+
                     return true;
                 }
+
                 false
             }
         }
@@ -566,125 +687,98 @@ impl DnsServer {
             .await;
 
         let _ = self.socket.send_to(&data, client).await;
+
         data
     }
 
     /// 转发请求到指定上游，发送响应给客户端，同时应用 marksite 并缓存结果。
-    async fn forward_and_cache(
-        &self,
-        kind: AddressQueryKind,
-        request: &[u8],
-        query_msg: &Message,
-        clean_domain: &str,
-        src: SocketAddr,
-        upstream: &SocketAddr,
-        tag: &str,
-        upstream_str: &str,
-    ) {
+    async fn forward_and_cache(&self, ctx: &RequestContext<'_>, upstream: &SocketAddr, tag: &str) {
         let resp = self
-            .forward_to_upstream_and_get(request, query_msg, upstream, &src)
+            .forward_to_upstream_and_get(ctx.request, ctx.query_msg, upstream, &ctx.src)
             .await;
-        print_first_ip(&resp, tag, clean_domain, upstream_str);
-        self.apply_mark_sites(&resp, clean_domain).await;
+
+        let upstream_str = upstream.to_string();
+
+        print_first_ip(&resp, tag, ctx.clean_domain, &upstream_str);
+
+        self.apply_mark_sites(&resp, ctx.clean_domain).await;
+
         self.cache_response(
-            clean_domain,
-            kind.cache_qtype(),
+            ctx.clean_domain,
+            ctx.kind.cache_qtype(),
             &resp,
-            kind.cache_skip_tag(),
+            ctx.kind.cache_skip_tag(),
         )
         .await;
     }
 
-    async fn forward_by_static_rules(
-        &self,
-        kind: AddressQueryKind,
-        request: &[u8],
-        query_msg: &Message,
-        clean_domain: &str,
-        src: SocketAddr,
-    ) -> bool {
+    async fn forward_by_static_rules(&self, ctx: &RequestContext<'_>) -> bool {
         // 特殊后缀检查：直接走 special_upstream
         for suffix in &self.special_suffixes {
-            if domain_matches_suffix(clean_domain, suffix) {
-                info!("[{}] {} -> dnsmasq", kind.special_tag(), clean_domain);
-                self.forward_and_cache(
-                    kind,
-                    request,
-                    query_msg,
-                    clean_domain,
-                    src,
-                    &self.special_upstream,
-                    kind.special_tag(),
-                    &self.special_upstream.to_string(),
-                )
-                .await;
+            if domain_matches_suffix(ctx.clean_domain, suffix) {
+                info!(
+                    "[{}] {} -> dnsmasq",
+                    ctx.kind.special_tag(),
+                    ctx.clean_domain
+                );
+
+                let upstream = self.special_upstream;
+
+                self.forward_and_cache(ctx, &upstream, ctx.kind.special_tag())
+                    .await;
+
                 return true;
             }
         }
 
         // 强制走国内上游
-        if is_forced(clean_domain, &self.force_domestic) {
+        if is_forced(ctx.clean_domain, &self.force_domestic) {
             debug!(
                 "[{}] {} -> {}",
-                kind.force_domestic_tag(),
-                clean_domain,
+                ctx.kind.force_domestic_tag(),
+                ctx.clean_domain,
                 self.domestic_upstream
             );
-            self.forward_and_cache(
-                kind,
-                request,
-                query_msg,
-                clean_domain,
-                src,
-                &self.domestic_upstream,
-                kind.force_domestic_tag(),
-                &self.domestic_upstream.to_string(),
-            )
-            .await;
+
+            let upstream = self.domestic_upstream;
+
+            self.forward_and_cache(ctx, &upstream, ctx.kind.force_domestic_tag())
+                .await;
+
             return true;
         }
 
         // 强制走国外上游
-        if is_forced(clean_domain, &self.force_foreign) {
+        if is_forced(ctx.clean_domain, &self.force_foreign) {
             info!(
                 "[{}] {} -> {}",
-                kind.force_foreign_tag(),
-                clean_domain,
+                ctx.kind.force_foreign_tag(),
+                ctx.clean_domain,
                 self.foreign_upstream
             );
-            self.forward_and_cache(
-                kind,
-                request,
-                query_msg,
-                clean_domain,
-                src,
-                &self.foreign_upstream,
-                kind.force_foreign_tag(),
-                &self.foreign_upstream.to_string(),
-            )
-            .await;
+
+            let upstream = self.foreign_upstream;
+
+            self.forward_and_cache(ctx, &upstream, ctx.kind.force_foreign_tag())
+                .await;
+
             return true;
         }
 
         // GFWList 检查：命中则直接走 foreign_upstream
         if let Some(ref gfw) = self.gfw_checker {
-            if gfw.check(clean_domain) {
+            if gfw.check(ctx.clean_domain) {
                 trace!(
                     "[{}] {} in gfwlist, direct to foreign",
-                    kind.gfwlist_tag(),
-                    clean_domain
+                    ctx.kind.gfwlist_tag(),
+                    ctx.clean_domain
                 );
-                self.forward_and_cache(
-                    kind,
-                    request,
-                    query_msg,
-                    clean_domain,
-                    src,
-                    &self.foreign_upstream,
-                    kind.gfwlist_tag(),
-                    &self.foreign_upstream.to_string(),
-                )
-                .await;
+
+                let upstream = self.foreign_upstream;
+
+                self.forward_and_cache(ctx, &upstream, ctx.kind.gfwlist_tag())
+                    .await;
+
                 return true;
             }
         }
@@ -722,12 +816,14 @@ impl DnsServer {
                                 false
                             }
                         }
+
                         None => {
                             debug!("[DOMESTIC-NO-IP] {} -> foreign", clean_domain);
                             false
                         }
                     }
                 }
+
                 Err(e) => {
                     warn!(
                         "Failed to parse domestic response for {}: {}",
@@ -737,6 +833,7 @@ impl DnsServer {
                     false
                 }
             },
+
             None => {
                 warn!("[DOMESTIC-TIMEOUT] {} -> foreign", clean_domain);
                 false
@@ -774,10 +871,12 @@ impl DnsServer {
                                 true
                             }
                         }
+
                         Some(_) => {
                             // 理论上 AAAA 查询不应返回非 IPv6 地址，这里保守使用国内结果
                             true
                         }
+
                         None => {
                             debug!("[DOMESTIC-NO-IP-AAAA] {} -> foreign", clean_domain);
                             false
@@ -788,6 +887,7 @@ impl DnsServer {
                     false
                 }
             }
+
             None => {
                 debug!("[DOMESTIC-TIMEOUT-AAAA] {} -> foreign", clean_domain);
                 false
@@ -809,39 +909,29 @@ impl DnsServer {
         }
     }
 
-    async fn handle_address_request(
-        &self,
-        kind: AddressQueryKind,
-        request: &[u8],
-        query_msg: &Message,
-        clean_domain: &str,
-        src: SocketAddr,
-    ) {
+    async fn handle_address_request(&self, ctx: RequestContext<'_>) {
         // hosts 处理：
         // - A：返回 hosts 里的 IPv4
-        // - AAAA：如果 hosts 里存在该域名，则返回 NODATA
-        if self
-            .handle_hosts_override(kind, query_msg, clean_domain, src)
-            .await
-        {
+        // - AAAA：如果 hosts 里存在该域名但无对应类型，则返回 NODATA
+        if self.handle_hosts_override(&ctx).await {
             return;
         }
 
         // 如果禁用了 AAAA，则不查缓存、不查上游，直接返回 NODATA
-        if kind == AddressQueryKind::Aaaa && !self.enable_ipv6_aaaa {
-            let nodata = build_nodata_response(query_msg);
-            let _ = self.socket.send_to(&nodata, src).await;
+        if ctx.kind == AddressQueryKind::Aaaa && !self.enable_ipv6_aaaa {
+            let nodata = build_nodata_response(ctx.query_msg);
+            let _ = self.socket.send_to(&nodata, ctx.src).await;
             return;
         }
 
         // 缓存检查
         if self
             .send_cached_response(
-                clean_domain,
-                kind.cache_qtype(),
-                query_msg.id(),
-                src,
-                kind.cache_hit_tag(),
+                ctx.clean_domain,
+                ctx.kind.cache_qtype(),
+                ctx.query_msg.id(),
+                ctx.src,
+                ctx.kind.cache_hit_tag(),
             )
             .await
         {
@@ -849,79 +939,63 @@ impl DnsServer {
         }
 
         // special suffix / force domestic / force foreign / gfwlist
-        if self
-            .forward_by_static_rules(kind, request, query_msg, clean_domain, src)
-            .await
-        {
+        if self.forward_by_static_rules(&ctx).await {
             return;
         }
 
         // 普通域名：先查国内，根据 A/AAAA 各自规则判断是否使用国内结果
         debug!(
             "[{}] {} -> {}",
-            kind.domestic_tag(),
-            clean_domain,
+            ctx.kind.domestic_tag(),
+            ctx.clean_domain,
             self.domestic_upstream
         );
 
-        let domestic_resp = self.send_dns_query(request, &self.domestic_upstream).await;
+        let domestic_resp = self
+            .send_dns_query(ctx.request, &self.domestic_upstream)
+            .await;
 
-        let use_domestic = self.should_use_domestic_response(kind, clean_domain, &domestic_resp);
+        let use_domestic =
+            self.should_use_domestic_response(ctx.kind, ctx.clean_domain, &domestic_resp);
 
         let (final_resp, chosen_tag, chosen_upstream) = if use_domestic {
-            let resp = domestic_resp.expect("domestic_rep must be Some");
+            let resp = domestic_resp.expect("domestic_resp must be Some when use_domestic is true");
+
             (
                 resp,
-                kind.domestic_tag(),
+                ctx.kind.domestic_tag(),
                 self.domestic_upstream.to_string(),
             )
         } else {
             let resp = self
                 .query_upstream_or_servfail(
-                    request,
-                    query_msg,
+                    ctx.request,
+                    ctx.query_msg,
                     &self.foreign_upstream,
-                    Some((kind.foreign_timeout_tag(), clean_domain)),
+                    Some((ctx.kind.foreign_timeout_tag(), ctx.clean_domain)),
                 )
                 .await;
-            (resp, kind.foreign_tag(), self.foreign_upstream.to_string())
+
+            (
+                resp,
+                ctx.kind.foreign_tag(),
+                self.foreign_upstream.to_string(),
+            )
         };
 
-        // 打印解析结果
-        if let Ok(msg) = Message::from_vec(&final_resp) {
-            if let Some(rr) = msg.answers().iter().find(|rr| {
-                rr.record_type() == RecordType::A || rr.record_type() == RecordType::AAAA
-            }) {
-                if let Some(ip) = rr.data().and_then(|d| d.ip_addr()) {
-                    info!(
-                        "[{}] {} -> {} resolved to {}",
-                        chosen_tag, clean_domain, chosen_upstream, ip
-                    );
-                } else {
-                    warn!(
-                        "[{}] {} -> {} (no A/AAAA answer)",
-                        chosen_tag, clean_domain, chosen_upstream
-                    );
-                }
-            } else {
-                warn!(
-                    "[{}] {} -> {} (no A/AAAA answer)",
-                    chosen_tag, clean_domain, chosen_upstream
-                );
-            }
-        }
+        print_first_ip(&final_resp, chosen_tag, ctx.clean_domain, &chosen_upstream);
 
-        // 只缓存 NOERROR 且有答案，TTL 为 0 不缓存
         self.cache_response(
-            clean_domain,
-            kind.cache_qtype(),
+            ctx.clean_domain,
+            ctx.kind.cache_qtype(),
             &final_resp,
-            kind.cache_skip_tag(),
+            ctx.kind.cache_skip_tag(),
         )
         .await;
 
-        let _ = self.socket.send_to(&final_resp, src).await;
-        self.apply_mark_sites(&final_resp, clean_domain).await;
+        let _ = self.socket.send_to(&final_resp, ctx.src).await;
+
+        self.apply_mark_sites(&final_resp, ctx.clean_domain).await;
     }
 
     async fn send_cached_response(
@@ -932,78 +1006,32 @@ impl DnsServer {
         src: SocketAddr,
         hit_tag: &str,
     ) -> bool {
-        let Some(cache_ref) = &self.cache else {
+        let Some(cache) = &self.cache else {
             return false;
         };
 
-        let key = (domain.to_string(), qtype_num);
-
-        let cached_data = {
-            let mut cache = cache_ref.lock().await;
-            let now = Instant::now();
-
-            let mut expired = false;
-
-            let data = if let Some(entry) = cache.get(&key) {
-                if entry.expire > now {
-                    Some(entry.data.clone())
-                } else {
-                    expired = true;
-                    None
-                }
-            } else {
-                None
-            };
-
-            if expired {
-                cache.pop(&key);
-            }
-
-            data
-        };
-
-        let Some(mut data) = cached_data else {
+        let Some(data) = cache.get_response(domain, qtype_num, req_id).await else {
             return false;
         };
 
         debug!("[{}] {}", hit_tag, domain);
 
-        rewrite_dns_id(&mut data, req_id);
-
         let _ = self.socket.send_to(&data, src).await;
-        // 暂不更新mark site, 避免压力过大
+
+        // 暂不更新 marksite，避免压力过大。
         // self.apply_mark_sites(&data, domain).await;
+
         true
     }
 
     async fn cache_response(&self, domain: &str, qtype_num: u16, response: &[u8], skip_tag: &str) {
-        let Some(cache_ref) = &self.cache else {
+        let Some(cache) = &self.cache else {
             return;
         };
 
-        let Ok(msg) = Message::from_vec(response) else {
-            return;
-        };
-
-        if msg.response_code() != ResponseCode::NoError || msg.answers().is_empty() {
-            return;
-        }
-
-        let Some(effective_ttl) = response_cache_ttl(&msg) else {
-            debug!("[{}] {} ttl=0", skip_tag, domain);
-            return;
-        };
-
-        let expire = Instant::now() + Duration::from_secs(effective_ttl);
-
-        let mut cache = cache_ref.lock().await;
-        cache.put(
-            (domain.to_string(), qtype_num),
-            CacheEntry {
-                data: response.to_vec(),
-                expire,
-            },
-        );
+        cache
+            .put_response(domain, qtype_num, response, skip_tag)
+            .await;
     }
 
     async fn query_upstream_or_servfail(
@@ -1015,6 +1043,7 @@ impl DnsServer {
     ) -> Vec<u8> {
         match self.send_dns_query(request, upstream).await {
             Some(resp) => resp,
+
             None => {
                 if let Some((tag, domain)) = timeout_log {
                     warn!("[{}] {} -> SERVFAIL", tag, domain);
@@ -1031,6 +1060,7 @@ impl DnsServer {
         loop {
             let (len, src) = match self.socket.recv_from(&mut buf).await {
                 Ok(v) => v,
+
                 Err(e) => {
                     error!("recv_from error: {}", e);
                     continue;
@@ -1049,15 +1079,17 @@ impl DnsServer {
     async fn handle_request(&self, request: Vec<u8>, src: SocketAddr) {
         let started_at = Instant::now();
 
-        // 解析查询
         let query_msg = match Message::from_vec(&request) {
             Ok(m) => m,
+
             Err(e) => {
                 let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+
                 error!(
                     "Failed to parse DNS request from {}: {}, cost={:.3}ms",
                     src, e, elapsed_ms
                 );
+
                 return;
             }
         };
@@ -1068,6 +1100,7 @@ impl DnsServer {
             let _ = self.socket.send_to(&servfail, src).await;
 
             let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+
             debug!(
                 "[DONE] {} multi-query -> SERVFAIL, cost={:.3}ms",
                 src, elapsed_ms
@@ -1079,29 +1112,31 @@ impl DnsServer {
         let query = &query_msg.queries()[0];
         let qtype = query.query_type();
         let raw_domain = query.name().to_utf8().to_string();
-        let clean_domain = canonical_domain(raw_domain.trim_end_matches('.'));
+        let clean_domain = canonical_domain(&raw_domain);
 
         match qtype {
             RecordType::A => {
-                self.handle_address_request(
-                    AddressQueryKind::A,
-                    &request,
-                    &query_msg,
-                    &clean_domain,
+                let ctx = RequestContext {
+                    kind: AddressQueryKind::A,
+                    request: &request,
+                    query_msg: &query_msg,
+                    clean_domain: &clean_domain,
                     src,
-                )
-                .await;
+                };
+
+                self.handle_address_request(ctx).await;
             }
 
             RecordType::AAAA => {
-                self.handle_address_request(
-                    AddressQueryKind::Aaaa,
-                    &request,
-                    &query_msg,
-                    &clean_domain,
+                let ctx = RequestContext {
+                    kind: AddressQueryKind::Aaaa,
+                    request: &request,
+                    query_msg: &query_msg,
+                    clean_domain: &clean_domain,
                     src,
-                )
-                .await;
+                };
+
+                self.handle_address_request(ctx).await;
             }
 
             _ => {
@@ -1123,32 +1158,50 @@ impl DnsServer {
     }
 
     async fn send_dns_query(&self, request: &[u8], upstream: &SocketAddr) -> Option<Vec<u8>> {
-        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+        let socket = match bind_ephemeral_udp_for(upstream).await {
             Ok(s) => s,
+
             Err(e) => {
-                error!("Failed to bind ephemeral socket: {}", e);
+                error!("Failed to bind ephemeral socket for {}: {}", upstream, e);
                 return None;
             }
         };
 
-        if let Err(e) = socket.send_to(request, upstream).await {
+        if let Err(e) = socket.connect(upstream).await {
+            error!("Failed to connect UDP socket to {}: {}", upstream, e);
+            return None;
+        }
+
+        if let Err(e) = socket.send(request).await {
             error!("Failed to send to {}: {}", upstream, e);
             return None;
         }
 
         let mut buf = [0u8; 4096];
 
-        match tokio::time::timeout(self.timeout, socket.recv_from(&mut buf)).await {
-            Ok(Ok((len, _))) => Some(buf[..len].to_vec()),
+        let len = match tokio::time::timeout(self.timeout, socket.recv(&mut buf)).await {
+            Ok(Ok(len)) => len,
+
             Ok(Err(e)) => {
                 warn!("recv error from {}: {}", upstream, e);
-                None
+                return None;
             }
+
             Err(_) => {
                 warn!("Timeout waiting for response from {}", upstream);
-                None
+                return None;
             }
+        };
+
+        let resp = buf[..len].to_vec();
+
+        // 简单校验 DNS transaction ID。
+        if request.len() >= 2 && resp.len() >= 2 && request[0..2] != resp[0..2] {
+            warn!("Mismatched DNS response ID from {}", upstream);
+            return None;
         }
+
+        Some(resp)
     }
 
     async fn forward_to_upstream(
@@ -1186,9 +1239,11 @@ async fn main() -> anyhow::Result<()> {
 
     let config_str = tokio::fs::read_to_string(&cli.config)
         .await
-        .expect("Failed to read config.toml");
+        .with_context(|| format!("Failed to read config file: {}", cli.config))?;
 
-    let config: Config = toml::from_str(&config_str).expect("Invalid config.toml");
+    let config: Config = toml::from_str(&config_str).context("Invalid config.toml")?;
+
+    validate_config(&config)?;
 
     let base = config
         .log_level
@@ -1203,12 +1258,14 @@ async fn main() -> anyhow::Result<()> {
         .without_time()
         .init();
 
+    let listen_text = config.listen.clone();
+
     // 加载 mmdb
     let mmdb_data = tokio::fs::read(&config.mmdb_path)
         .await
-        .expect("Failed to read MMDB database");
+        .with_context(|| format!("Failed to read MMDB database: {}", config.mmdb_path))?;
 
-    let mmdb = Reader::from_source(mmdb_data).expect("Invalid MMDB database");
+    let mmdb = Reader::from_source(mmdb_data).context("Invalid MMDB database")?;
 
     // 加载 GFWList 并构建布隆过滤器
     let gfw_checker = if let Some(path) = &config.gfwlist_path {
@@ -1225,12 +1282,14 @@ async fn main() -> anyhow::Result<()> {
                         info!("Bloom filter built with fp_rate={:.2}%", fp_rate * 100.0);
                         Some(checker)
                     }
+
                     Err(e) => {
                         error!("Failed to build bloom filter: {}", e);
                         None
                     }
                 }
             }
+
             Err(e) => {
                 error!("Failed to parse GFWList: {}", e);
                 None
@@ -1242,42 +1301,29 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 绑定 UDP socket
-    let addr: SocketAddr = config.listen.parse()?;
+    let addr: SocketAddr = config
+        .listen
+        .parse()
+        .with_context(|| format!("Invalid listen address: {}", config.listen))?;
 
-    let socket = match addr {
-        SocketAddr::V4(_) => {
-            // 显式 IPv4 地址则仅绑定 IPv4
-            UdpSocket::bind(addr).await?
-        }
-        SocketAddr::V6(_) => {
-            // IPv6 地址：同时兼容 IPv4
-            let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-            socket.set_only_v6(false)?;
-            socket.set_nonblocking(true)?;
-            socket.bind(&addr.into())?;
-            UdpSocket::from_std(socket.into())?
-        }
-    };
+    let socket = bind_listen_socket(addr).await?;
 
-    let special_upstream: SocketAddr = config.special_upstream.parse()?;
-    let domestic_upstream: SocketAddr = config.domestic_upstream.parse()?;
-    let foreign_upstream: SocketAddr = config.foreign_upstream.parse()?;
+    let special_upstream: SocketAddr = config
+        .special_upstream
+        .parse()
+        .with_context(|| format!("Invalid special_upstream: {}", config.special_upstream))?;
 
-    let cache = std::num::NonZeroUsize::new(config.cache_size)
-        .map(|size| tokio::sync::Mutex::new(lru::LruCache::new(size)));
+    let domestic_upstream: SocketAddr = config
+        .domestic_upstream
+        .parse()
+        .with_context(|| format!("Invalid domestic_upstream: {}", config.domestic_upstream))?;
 
-    fn parse_hosts<A: FromStr<Err = std::net::AddrParseError>>(
-        map: &HashMap<String, String>,
-    ) -> HashMap<String, A> {
-        map.iter()
-            .map(|(k, v)| {
-                let addr = v
-                    .parse::<A>()
-                    .unwrap_or_else(|e| panic!("invalid IP for {k}: {e}"));
-                (canonical_domain(k), addr)
-            })
-            .collect()
-    }
+    let foreign_upstream: SocketAddr = config
+        .foreign_upstream
+        .parse()
+        .with_context(|| format!("Invalid foreign_upstream: {}", config.foreign_upstream))?;
+
+    let cache = NonZeroUsize::new(config.cache_size).map(DnsCache::new);
 
     let (hosts_v4, hosts_v6) = config.hosts.as_ref().map_or((None, None), |h| {
         let v4 = h.ipv4.as_ref().map(|m| parse_hosts::<Ipv4Addr>(m));
@@ -1285,20 +1331,34 @@ async fn main() -> anyhow::Result<()> {
         (v4, v6)
     });
 
+    let special_suffixes: Vec<String> = config
+        .special_suffixes
+        .iter()
+        .map(|s| canonical_domain(s))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let force_foreign = normalize_domain_list(config.force_foreign_domains);
+    let force_domestic = normalize_domain_list(config.force_domestic_domains);
+
     let mark_sites = config.marksite.as_ref().map(|map| {
         let groups: Vec<MarkGroup> = map
             .iter()
             .map(|(table, domains)| {
                 let nft_table = format!("{}{}", NFT_TABLE_PREFIX, table);
+
                 let rules: Vec<MarkRule> = domains
                     .iter()
                     .map(|d| MarkRule {
-                        pattern: d.to_ascii_lowercase(),
+                        pattern: canonical_domain(d),
                     })
+                    .filter(|r| !r.pattern.is_empty())
                     .collect();
+
                 MarkGroup { nft_table, rules }
             })
             .collect();
+
         MarkSites { groups }
     });
 
@@ -1316,11 +1376,13 @@ async fn main() -> anyhow::Result<()> {
     let nft_manager = mark_sites.as_ref().map(|_| Arc::new(CommandNftManager));
 
     // 初始化 nft 表与集合
-    if let Some(ref ms) = mark_sites
-        && let Some(ref nft) = nft_manager
-    {
-        for group in &ms.groups {
-            nft.ensure_table(&group.nft_table);
+    if let Some(ref ms) = mark_sites {
+        if let Some(ref nft) = nft_manager {
+            for group in &ms.groups {
+                if let Err(e) = nft.ensure_table(&group.nft_table) {
+                    error!("Failed to ensure nft table '{}': {}", group.nft_table, e);
+                }
+            }
         }
     }
 
@@ -1330,22 +1392,83 @@ async fn main() -> anyhow::Result<()> {
         domestic_upstream,
         foreign_upstream,
         mmdb,
-        special_suffixes: config.special_suffixes,
+        special_suffixes,
         cache,
         timeout: Duration::from_secs(config.query_timeout_sec),
         enable_ipv6_aaaa: config.enable_ipv6_aaaa,
         gfw_checker,
-        force_foreign: config.force_foreign_domains,
-        force_domestic: config.force_domestic_domains,
+        force_foreign,
+        force_domestic,
         hosts_v4,
         hosts_v6,
         mark_sites,
         nft_manager,
     });
 
-    info!("tsubamegaeshi-rs started on {}", config.listen);
+    info!("tsubamegaeshi-rs started on {}", listen_text);
 
     server.run().await;
+
+    Ok(())
+}
+
+async fn bind_listen_socket(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
+    match addr {
+        SocketAddr::V4(_) => Ok(UdpSocket::bind(addr).await?),
+
+        SocketAddr::V6(_) => {
+            let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+            socket.set_only_v6(false)?;
+            socket.set_nonblocking(true)?;
+            socket.bind(&addr.into())?;
+
+            Ok(UdpSocket::from_std(socket.into())?)
+        }
+    }
+}
+
+fn parse_hosts<A: FromStr<Err = std::net::AddrParseError>>(
+    map: &HashMap<String, String>,
+) -> HashMap<String, A> {
+    map.iter()
+        .map(|(k, v)| {
+            let addr = v
+                .parse::<A>()
+                .unwrap_or_else(|e| panic!("invalid IP for {k}: {e}"));
+
+            (canonical_domain(k), addr)
+        })
+        .collect()
+}
+
+fn validate_config(config: &Config) -> anyhow::Result<()> {
+    if config.query_timeout_sec == 0 {
+        anyhow::bail!("query_timeout_sec must be greater than 0");
+    }
+
+    if let Some(rate) = config.gfbloom_fp_rate {
+        if !(rate > 0.0 && rate < 1.0) {
+            anyhow::bail!("gfbloom_fp_rate must be greater than 0.0 and less than 1.0");
+        }
+    }
+
+    if let Some(marksite) = &config.marksite {
+        for table in marksite.keys() {
+            if table.is_empty() {
+                anyhow::bail!("marksite table suffix cannot be empty");
+            }
+
+            if !table
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                anyhow::bail!(
+                    "invalid marksite table suffix '{}': only ASCII letters, digits, '_' and '-' are allowed",
+                    table
+                );
+            }
+        }
+    }
 
     Ok(())
 }
@@ -1362,24 +1485,20 @@ pub struct CommandNftManager;
 
 impl CommandNftManager {
     #[rustfmt::skip]
-    pub fn ensure_table(&self, table: &str) {
-        let _ = Command::new("/usr/sbin/nft")
-            .args(["add", "table", "inet", table])
-            .status();
+    pub fn ensure_table(&self, table: &str) -> io::Result<()> {
+        run_nft_ignore_existing(&["add", "table", "inet", table])?;
 
-        let _ = Command::new("/usr/sbin/nft")
-            .args([
-                "add", "set", "inet", table, "spam_ips",
-                "{", "type", "ipv4_addr;", "timeout", "1h;", "flags", "timeout,dynamic;", "}",
-            ])
-            .status();
+        run_nft_ignore_existing(&[
+            "add", "set", "inet", table, "spam_ips",
+            "{", "type", "ipv4_addr;", "timeout", "1h;", "flags", "timeout,dynamic;", "}",
+        ])?;
 
-        let _ = Command::new("/usr/sbin/nft")
-            .args([
-                "add", "set", "inet", table, "spam_ips6",
-                "{", "type", "ipv6_addr;", "timeout", "1h;", "flags", "timeout,dynamic;", "}",
-            ])
-            .status();
+        run_nft_ignore_existing(&[
+            "add", "set", "inet", table, "spam_ips6",
+            "{", "type", "ipv6_addr;", "timeout", "1h;", "flags", "timeout,dynamic;", "}",
+        ])?;
+
+        Ok(())
     }
 }
 
@@ -1389,19 +1508,45 @@ impl NftManager for CommandNftManager {
             IpAddr::V4(_) => "spam_ips",
             IpAddr::V6(_) => "spam_ips6",
         };
+
         let elem = format!("{{ {} }}", addr);
+
         let output = Command::new("/usr/sbin/nft")
             .args(["add", "element", "inet", table, set_name, &elem])
             .output()?;
+
         if output.status.success() {
             Ok(())
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
+
             Err(io::Error::other(format!(
                 "nft add element failed: table={table}, set={set_name}, addr={addr}: {stderr}"
             )))
         }
     }
+}
+
+fn run_nft_ignore_existing(args: &[&str]) -> io::Result<()> {
+    let output = Command::new("/usr/sbin/nft").args(args).output()?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // nft 重复创建 table/set 时一般会报 already exists。
+    // 这里保留幂等行为，但其他错误返回。
+    if stderr.contains("File exists") || stderr.contains("exists") {
+        return Ok(());
+    }
+
+    Err(io::Error::other(format!(
+        "nft command failed: nft {}: {}",
+        args.join(" "),
+        stderr
+    )))
 }
 
 // ----- MarkSites -----
@@ -1424,7 +1569,7 @@ struct MarkSites {
 
 impl MarkSites {
     pub fn match_groups(&self, domain: &str) -> impl Iterator<Item = &MarkGroup> {
-        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        let domain = canonical_domain(domain);
 
         self.groups.iter().filter(move |group| {
             group.rules.iter().any(|rule| {
