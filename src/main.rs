@@ -565,6 +565,32 @@ impl DnsServer {
         data
     }
 
+    /// 转发请求到指定上游，发送响应给客户端，同时应用 marksite 并缓存结果。
+    async fn forward_and_cache(
+        &self,
+        kind: AddressQueryKind,
+        request: &[u8],
+        query_msg: &Message,
+        clean_domain: &str,
+        src: SocketAddr,
+        upstream: &SocketAddr,
+        tag: &str,
+        upstream_str: &str,
+    ) {
+        let resp = self
+            .forward_to_upstream_and_get(request, query_msg, upstream, &src)
+            .await;
+        print_first_ip(&resp, tag, clean_domain, upstream_str);
+        self.apply_mark_sites(&resp, clean_domain).await;
+        self.cache_response(
+            clean_domain,
+            kind.cache_qtype(),
+            &resp,
+            kind.cache_skip_tag(),
+        )
+        .await;
+    }
+
     async fn forward_by_static_rules(
         &self,
         kind: AddressQueryKind,
@@ -577,18 +603,17 @@ impl DnsServer {
         for suffix in &self.special_suffixes {
             if domain_matches_suffix(clean_domain, suffix) {
                 info!("[{}] {} -> dnsmasq", kind.special_tag(), clean_domain);
-
-                let resp = self
-                    .forward_to_upstream_and_get(request, query_msg, &self.special_upstream, &src)
-                    .await;
-
-                print_first_ip(
-                    &resp,
-                    kind.special_tag(),
+                self.forward_and_cache(
+                    kind,
+                    request,
+                    query_msg,
                     clean_domain,
+                    src,
+                    &self.special_upstream,
+                    kind.special_tag(),
                     &self.special_upstream.to_string(),
-                );
-                self.apply_mark_sites(&resp, clean_domain).await;
+                )
+                .await;
                 return true;
             }
         }
@@ -601,18 +626,17 @@ impl DnsServer {
                 clean_domain,
                 self.domestic_upstream
             );
-
-            let resp = self
-                .forward_to_upstream_and_get(request, query_msg, &self.domestic_upstream, &src)
-                .await;
-
-            print_first_ip(
-                &resp,
-                kind.force_domestic_tag(),
+            self.forward_and_cache(
+                kind,
+                request,
+                query_msg,
                 clean_domain,
+                src,
+                &self.domestic_upstream,
+                kind.force_domestic_tag(),
                 &self.domestic_upstream.to_string(),
-            );
-            self.apply_mark_sites(&resp, clean_domain).await;
+            )
+            .await;
             return true;
         }
 
@@ -624,18 +648,17 @@ impl DnsServer {
                 clean_domain,
                 self.foreign_upstream
             );
-
-            let resp = self
-                .forward_to_upstream_and_get(request, query_msg, &self.foreign_upstream, &src)
-                .await;
-
-            print_first_ip(
-                &resp,
-                kind.force_foreign_tag(),
+            self.forward_and_cache(
+                kind,
+                request,
+                query_msg,
                 clean_domain,
+                src,
+                &self.foreign_upstream,
+                kind.force_foreign_tag(),
                 &self.foreign_upstream.to_string(),
-            );
-            self.apply_mark_sites(&resp, clean_domain).await;
+            )
+            .await;
             return true;
         }
 
@@ -647,18 +670,17 @@ impl DnsServer {
                     kind.gfwlist_tag(),
                     clean_domain
                 );
-
-                let resp = self
-                    .forward_to_upstream_and_get(request, query_msg, &self.foreign_upstream, &src)
-                    .await;
-
-                print_first_ip(
-                    &resp,
-                    kind.gfwlist_tag(),
+                self.forward_and_cache(
+                    kind,
+                    request,
+                    query_msg,
                     clean_domain,
+                    src,
+                    &self.foreign_upstream,
+                    kind.gfwlist_tag(),
                     &self.foreign_upstream.to_string(),
-                );
-                self.apply_mark_sites(&resp, clean_domain).await;
+                )
+                .await;
                 return true;
             }
         }
