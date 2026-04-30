@@ -1,0 +1,15 @@
+[target.mips-unknown-linux-musl]
+image = "ghcr.io/cross-rs/mips-unknown-linux-musl:edge"
+build-std = ["std", "panic_abort"]
+
+[target.mipsel-unknown-linux-musl]
+image = "ghcr.io/cross-rs/mipsel-unknown-linux-musl:edge"
+build-std = ["std", "panic_abort"]
+
+[target.mips64-unknown-linux-muslabi64]
+image = "ghcr.io/cross-rs/mips64-unknown-linux-muslabi64:edge"
+build-std = ["std", "panic_abort"]
+
+[target.mips64el-unknown-linux-muslabi64]
+image = "ghcr.io/cross-rs/mips64el-unknown-linux-muslabi64:edge"
+build-std = ["std", "panic_abort"]
