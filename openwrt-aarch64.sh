@@ -18,7 +18,7 @@ aarch64-openwrt-linux-musl-strip $BIN
 
 # upx 压缩（需要本地安装 upx）
 if command -v upx &>/dev/null; then
-  upx -3 $BIN
+  upx --lzma $BIN
   echo "UPX compression done"
 else
   echo "upx not found, skipping compression"
