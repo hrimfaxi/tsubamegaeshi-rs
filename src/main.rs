@@ -1233,6 +1233,12 @@ impl DnsServer {
     }
 }
 
+fn parse_upstream(s: &str, field_name: &str) -> anyhow::Result<SocketAddr> {
+    s.parse::<SocketAddr>()
+        .or_else(|_| s.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))
+        .with_context(|| format!("Invalid {}: {}", field_name, s))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -1308,21 +1314,9 @@ async fn main() -> anyhow::Result<()> {
 
     let socket = bind_listen_socket(addr).await?;
 
-    let special_upstream: SocketAddr = config
-        .special_upstream
-        .parse()
-        .with_context(|| format!("Invalid special_upstream: {}", config.special_upstream))?;
-
-    let domestic_upstream: SocketAddr = config
-        .domestic_upstream
-        .parse()
-        .with_context(|| format!("Invalid domestic_upstream: {}", config.domestic_upstream))?;
-
-    let foreign_upstream: SocketAddr = config
-        .foreign_upstream
-        .parse()
-        .with_context(|| format!("Invalid foreign_upstream: {}", config.foreign_upstream))?;
-
+    let special_upstream = parse_upstream(&config.special_upstream, "special_upstream")?;
+    let domestic_upstream = parse_upstream(&config.domestic_upstream, "domestic_upstream")?;
+    let foreign_upstream = parse_upstream(&config.foreign_upstream, "foreign_upstream")?;
     let cache = NonZeroUsize::new(config.cache_size).map(DnsCache::new);
 
     let (hosts_v4, hosts_v6) = config.hosts.as_ref().map_or((None, None), |h| {
