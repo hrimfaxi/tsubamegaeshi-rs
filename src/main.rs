@@ -20,6 +20,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, trace, warn};
 
 use base64::Engine;
@@ -27,6 +28,8 @@ use base64::engine::general_purpose::STANDARD;
 
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_AAAA: u16 = 28;
+
+static NFT_SEM: Semaphore = Semaphore::const_new(4);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AddressQueryKind {
@@ -424,12 +427,29 @@ fn print_first_ip(resp: &[u8], tag: &str, domain: &str, upstream: &str) {
 
 impl DnsServer {
     /// 根据最终应答和域名，将解析出的 IP 异步添加到匹配的 nft 表中。
-    fn apply_mark_sites(&self, final_resp: &[u8], clean_domain: &str) {
+    async fn apply_mark_sites(&self, final_resp: &[u8], clean_domain: &str) {
         let Some(mark_sites) = &self.mark_sites else {
             return;
         };
         let Some(nft) = &self.nft_manager else { return };
 
+        // 1. 先快速检查是否有匹配的 nft 组
+        let matched_groups: Vec<&MarkGroup> = mark_sites.match_groups(clean_domain).collect();
+        if matched_groups.is_empty() {
+            return;
+        }
+
+        info!(
+            "[MARK_SITES] domain '{}' matched {} group(s): {:?}",
+            clean_domain,
+            matched_groups.len(),
+            matched_groups
+                .iter()
+                .map(|g| &g.nft_table)
+                .collect::<Vec<_>>()
+        );
+
+        // 2. 只有确认需要标记时，才提取 IP（并去重）
         let ips: Vec<IpAddr> = match Message::from_vec(final_resp) {
             Ok(msg) => msg
                 .answers()
@@ -441,16 +461,13 @@ impl DnsServer {
                         None
                     }
                 })
+                .collect::<HashSet<_>>()
+                .into_iter()
                 .collect(),
             Err(_) => vec![],
         };
 
         if ips.is_empty() {
-            return;
-        }
-
-        let matched_groups: Vec<&MarkGroup> = mark_sites.match_groups(clean_domain).collect();
-        if matched_groups.is_empty() {
             return;
         }
 
@@ -464,11 +481,10 @@ impl DnsServer {
             }
         }
 
-        if entries.is_empty() {
-            return;
-        }
-
+        // 异步获取许可，限制并发
+        let permit = NFT_SEM.acquire().await;
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             for (table, ip) in entries {
                 if let Err(e) = nft_manager.as_ref().add_ip_to_group(&table, ip) {
                     error!(
@@ -495,7 +511,7 @@ impl DnsServer {
                     let resp = build_a_response(query_msg, *ip, 60);
                     info!("[HOSTS-A] {} -> {}", clean_domain, ip);
                     let _ = self.socket.send_to(&resp, src).await;
-                    self.apply_mark_sites(&resp, clean_domain);
+                    // self.apply_mark_sites(&resp, clean_domain).await;
                     return true;
                 }
                 // 检查是否仅存在于 v6 表中
@@ -516,7 +532,7 @@ impl DnsServer {
                     let resp = build_aaaa_response(query_msg, *ip, 60);
                     info!("[HOSTS-AAAA] {} -> {}", clean_domain, ip);
                     let _ = self.socket.send_to(&resp, src).await;
-                    self.apply_mark_sites(&resp, clean_domain);
+                    // self.apply_mark_sites(&resp, clean_domain).await;
                     return true;
                 }
                 if self
@@ -572,7 +588,7 @@ impl DnsServer {
                     clean_domain,
                     &self.special_upstream.to_string(),
                 );
-                self.apply_mark_sites(&resp, clean_domain);
+                self.apply_mark_sites(&resp, clean_domain).await;
                 return true;
             }
         }
@@ -596,7 +612,7 @@ impl DnsServer {
                 clean_domain,
                 &self.domestic_upstream.to_string(),
             );
-            self.apply_mark_sites(&resp, clean_domain);
+            self.apply_mark_sites(&resp, clean_domain).await;
             return true;
         }
 
@@ -619,7 +635,7 @@ impl DnsServer {
                 clean_domain,
                 &self.foreign_upstream.to_string(),
             );
-            self.apply_mark_sites(&resp, clean_domain);
+            self.apply_mark_sites(&resp, clean_domain).await;
             return true;
         }
 
@@ -642,7 +658,7 @@ impl DnsServer {
                     clean_domain,
                     &self.foreign_upstream.to_string(),
                 );
-                self.apply_mark_sites(&resp, clean_domain);
+                self.apply_mark_sites(&resp, clean_domain).await;
                 return true;
             }
         }
@@ -879,7 +895,7 @@ impl DnsServer {
         .await;
 
         let _ = self.socket.send_to(&final_resp, src).await;
-        self.apply_mark_sites(&final_resp, clean_domain);
+        self.apply_mark_sites(&final_resp, clean_domain).await;
     }
 
     async fn send_cached_response(
@@ -929,7 +945,8 @@ impl DnsServer {
         rewrite_dns_id(&mut data, req_id);
 
         let _ = self.socket.send_to(&data, src).await;
-        self.apply_mark_sites(&data, domain);
+        // 暂不更新mark site, 避免压力过大
+        // self.apply_mark_sites(&data, domain).await;
         true
     }
 
@@ -1346,18 +1363,16 @@ impl NftManager for CommandNftManager {
             IpAddr::V4(_) => "spam_ips",
             IpAddr::V6(_) => "spam_ips6",
         };
-
         let elem = format!("{{ {} }}", addr);
-
-        let status = Command::new("/usr/sbin/nft")
+        let output = Command::new("/usr/sbin/nft")
             .args(["add", "element", "inet", table, set_name, &elem])
-            .status()?;
-
-        if status.success() {
+            .output()?;
+        if output.status.success() {
             Ok(())
         } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
             Err(io::Error::other(format!(
-                "nft add element failed: table={table}, set={set_name}, addr={addr}"
+                "nft add element failed: table={table}, set={set_name}, addr={addr}: {stderr}"
             )))
         }
     }
