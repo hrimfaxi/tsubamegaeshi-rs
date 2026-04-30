@@ -1,9 +1,18 @@
 listen = "[::]:53"
-special_suffixes = [".h", ".local", ".lan", ".home", ".yellowbigbird.com", ]
+special_suffixes = [".h", ".local", ".lan", ".home", ]
+
+# openwrt dnsmasq 地址
 special_upstream = "127.0.0.1:5353"
-domestic_upstream = "223.5.5.5:53"
-#foreign_upstream = "206.237.23.241:5353"
-foreign_upstream = "127.0.0.1:5354"
+
+# 国内dns地址
+domestic_upstream = "223.5.5.5"
+
+# 国际dns地址
+foreign_upstream = "8.8.8.8"
+
+# 也可使用xray-core任意门转发到dns服务器
+# foreign_upstream = "127.0.0.1:5354"
+
 cache_size = 300
 query_timeout_sec = 3
 log_level = "debug"
@@ -22,19 +31,10 @@ force_domestic_domains = [
 
 # 静态 hosts 记录 (用于关键域名兜底，避免 Xray 未启动时无法解析)
 [hosts.ipv4]
-"aliyun.yellowbigbird.com" = "47.108.136.105"
-"rack-real.yellowbigbird.com" = "107.174.121.146"
-"bird2.yellowbigbird.com" = "172.93.188.169"
-"bird4.yellowbigbird.com" = "8.210.12.134"
-"niyaou.yellowbigbird.com" = "144.34.136.17"
-"niyaou2.yellowbigbird.com" = "66.112.212.45"
-"vmshell.yellowbigbird.com" = "23.173.216.120"
-"zgo.yellowbigbird.com" = "23.185.200.253"
-"vultr.yellowbigbird.com" = "45.77.70.206"
 "ip.3322.net" = "118.184.169.32"
 
 [hosts.ipv6]
-"vultr.yellowbigbird.com" = "2001:19f0:6001:804:5400:1ff:fe39:3399"
+"google.com" = "2607:f8b0:400a:809::200e"
 
 [marksite]
 youtube = [

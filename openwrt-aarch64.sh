@@ -1,6 +1,6 @@
 #!/bin/bash
 
-TOOLCHAIN=~/temp/openwrt-sdk-25.12.0-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64/staging_dir/toolchain-aarch64_cortex-a53_gcc-14.3.0_musl/bin
+TOOLCHAIN=~/temp/openwrt-sdk-25.12.2-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64/staging_dir/toolchain-aarch64_cortex-a53_gcc-14.3.0_musl/bin
 export PATH=$TOOLCHAIN:$PATH
 
 export CC_aarch64_unknown_linux_musl=$TOOLCHAIN/aarch64-openwrt-linux-musl-gcc
@@ -25,5 +25,5 @@ else
 fi
 
 # 上传并重启
-#rsync -avrPzz $BIN zdxlz:/usr/bin
-#ssh zdxlz service tsubamegaeshi-rs restart
+rsync -avrPzz $BIN zdxlz:/usr/bin
+ssh zdxlz service tsubamegaeshi-rs restart
