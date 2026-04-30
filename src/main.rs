@@ -178,6 +178,10 @@ struct DnsServer {
     nft_manager: Option<Arc<CommandNftManager>>,
 }
 
+fn canonical_domain(domain: &str) -> String {
+    domain.to_ascii_lowercase()
+}
+
 /// 域名后缀匹配。
 ///
 /// 匹配：
@@ -1075,7 +1079,7 @@ impl DnsServer {
         let query = &query_msg.queries()[0];
         let qtype = query.query_type();
         let raw_domain = query.name().to_utf8().to_string();
-        let clean_domain = raw_domain.trim_end_matches('.').to_string();
+        let clean_domain = canonical_domain(raw_domain.trim_end_matches('.'));
 
         match qtype {
             RecordType::A => {
@@ -1270,7 +1274,7 @@ async fn main() -> anyhow::Result<()> {
                 let addr = v
                     .parse::<A>()
                     .unwrap_or_else(|e| panic!("invalid IP for {k}: {e}"));
-                (k.clone(), addr)
+                (canonical_domain(k), addr)
             })
             .collect()
     }
