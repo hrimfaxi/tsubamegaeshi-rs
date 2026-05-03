@@ -13,6 +13,10 @@ foreign_upstream = "8.8.8.8"
 # 也可使用xray-core任意门转发到dns服务器
 # foreign_upstream = "127.0.0.1:5354"
 
+# 广告列表: 推荐：https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockdomainlite.txt
+adblock_path = "/etc/tsubamegaeshi-rs/adblockdomainlite.txt"
+adblock_fp_rate = 0.001
+
 cache_size = 300
 query_timeout_sec = 3
 log_level = "debug"

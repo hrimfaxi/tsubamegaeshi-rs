@@ -152,6 +152,11 @@ struct Config {
 
     #[serde(default)]
     marksite: Option<HashMap<String, Vec<String>>>,
+
+    /// AdBlock 规则文件路径（如 EasyList China）
+    adblock_path: Option<String>,
+    /// 布隆过滤器误判率，默认 0.001
+    adblock_fp_rate: Option<f64>,
 }
 
 struct CacheEntry {
@@ -246,6 +251,7 @@ struct DnsServer {
     hosts_v6: Option<HashMap<String, Ipv6Addr>>,
     mark_sites: Option<MarkSites>,
     nft_manager: Option<Arc<CommandNftManager>>,
+    adblock_checker: Option<Arc<AdblockChecker>>,
 }
 
 struct RequestContext<'a> {
@@ -924,6 +930,24 @@ impl DnsServer {
             return;
         }
 
+        // 2. 广告屏蔽（新增）
+        if let Some(ref adblock) = self.adblock_checker {
+            if adblock.check(ctx.clean_domain) {
+                let blocked_response = match ctx.kind {
+                    AddressQueryKind::A => {
+                        info!("[ADBLOCK-A] {} -> 0.0.0.0", ctx.clean_domain);
+                        build_a_response(ctx.query_msg, Ipv4Addr::new(0, 0, 0, 0), 60)
+                    }
+                    AddressQueryKind::Aaaa => {
+                        info!("[ADBLOCK-AAAA] {} -> ::", ctx.clean_domain);
+                        build_aaaa_response(ctx.query_msg, Ipv6Addr::UNSPECIFIED, 60)
+                    }
+                };
+                let _ = self.socket.send_to(&blocked_response, ctx.src).await;
+                return;
+            }
+        }
+
         // 缓存检查
         if self
             .send_cached_response(
@@ -1306,6 +1330,32 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let adblock_checker = if let Some(path) = &config.adblock_path {
+        info!("Loading AdBlock list from {}", path);
+        match AdblockDecoder::new(path).extract_domains() {
+            Ok(domains) => {
+                info!("Extracted {} adblock domains", domains.len());
+                let fp_rate = config.adblock_fp_rate.unwrap_or(0.001);
+                match AdblockChecker::new(&domains, fp_rate) {
+                    Ok(checker) => {
+                        info!("AdBlock checker built (fp={:.2}%)", fp_rate * 100.0);
+                        Some(Arc::new(checker))
+                    }
+                    Err(e) => {
+                        error!("Failed to build AdBlock checker: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to parse AdBlock file: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 绑定 UDP socket
     let addr: SocketAddr = config
         .listen
@@ -1397,6 +1447,7 @@ async fn main() -> anyhow::Result<()> {
         hosts_v6,
         mark_sites,
         nft_manager,
+        adblock_checker,
     });
 
     info!("tsubamegaeshi-rs started on {}", listen_text);
@@ -1461,6 +1512,12 @@ fn validate_config(config: &Config) -> anyhow::Result<()> {
                     table
                 );
             }
+        }
+    }
+
+    if let Some(rate) = config.adblock_fp_rate {
+        if !(rate > 0.0 && rate < 1.0) {
+            anyhow::bail!("adblock_fp_rate must be between 0.0 and 1.0");
         }
     }
 
@@ -1571,5 +1628,118 @@ impl MarkSites {
                 domain.contains(&rule.pattern)
             })
         })
+    }
+}
+
+fn looks_like_domain(s: &str) -> bool {
+    if s.is_empty() || !s.contains('.') || s.starts_with('.') || s.ends_with('.') {
+        return false;
+    }
+
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+struct AdblockDecoder {
+    file_path: String,
+}
+
+impl AdblockDecoder {
+    fn new(path: &str) -> Self {
+        Self {
+            file_path: path.into(),
+        }
+    }
+
+    fn extract_domains(&self) -> Result<Vec<String>> {
+        let content = fs::read_to_string(&self.file_path)?;
+        let mut domains = Vec::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('!') || line.starts_with('[') {
+                continue;
+            }
+
+            // 处理 ||domain^ 形式
+            if let Some(rest) = line.strip_prefix("||") {
+                let domain = rest
+                    .split(|c: char| c == '^' || c == '/' || c == '?' || c == '#' || c == '*')
+                    .next()
+                    .unwrap_or(rest);
+                let domain = domain.trim();
+                if looks_like_domain(domain) {
+                    domains.push(canonical_domain(domain));
+                }
+            }
+            // 处理 .example.com 形式
+            else if let Some(rest) = line.strip_prefix('.') {
+                let domain = rest
+                    .split(|c: char| c == '^' || c == '/' || c == '?' || c == '#' || c == '*')
+                    .next()
+                    .unwrap_or(rest);
+                let domain = domain.trim();
+                if looks_like_domain(domain) {
+                    domains.push(canonical_domain(domain));
+                }
+            }
+            // 纯域名（无修饰符），忽略带 $ 的选项规则
+            else if !line.starts_with('@') && !line.contains('$') {
+                let domain = line
+                    .split(|c: char| c == '^' || c == '/' || c == '?' || c == '#')
+                    .next()
+                    .unwrap_or(line);
+                let domain = domain.trim();
+                if looks_like_domain(domain) {
+                    domains.push(canonical_domain(domain));
+                }
+            }
+        }
+
+        let unique: HashSet<String> = domains.into_iter().collect();
+        Ok(unique.into_iter().collect())
+    }
+}
+
+pub struct AdblockChecker {
+    bloom: Bloom<Vec<u8>>,
+    exact: HashSet<String>,
+}
+
+impl AdblockChecker {
+    pub fn new(domains: &[String], fp_rate: f64) -> Result<Self> {
+        let num = domains.len();
+        if num == 0 {
+            anyhow::bail!("No adblock domains");
+        }
+        let mut bloom = Bloom::<Vec<u8>>::new_for_fp_rate(num, fp_rate)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        let mut exact = HashSet::with_capacity(num);
+        for domain in domains {
+            let domain = canonical_domain(domain);
+            bloom.set(&domain.as_bytes().to_vec());
+            exact.insert(domain);
+        }
+
+        Ok(Self { bloom, exact })
+    }
+
+    pub fn check(&self, domain: &str) -> bool {
+        let domain = canonical_domain(domain);
+        let mut parts: Vec<&str> = domain.split('.').collect();
+
+        while parts.len() >= 2 {
+            let candidate = parts.join(".");
+            let key = candidate.as_bytes().to_vec();
+
+            if self.bloom.check(&key) && self.exact.contains(&candidate) {
+                return true;
+            }
+
+            parts.remove(0);
+        }
+
+        false
     }
 }
