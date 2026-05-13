@@ -7,8 +7,8 @@ use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::rdata::A as ARecord;
 use hickory_proto::rr::rdata::AAAA as AAAARecord;
 use hickory_proto::rr::{RData, Record, RecordType};
+use maxminddb::Reader;
 use maxminddb::geoip2::Country;
-use maxminddb::{Mmap, Reader};
 use serde::Deserialize;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, HashSet};
@@ -239,7 +239,7 @@ struct DnsServer {
     special_upstream: SocketAddr,
     domestic_upstream: SocketAddr,
     foreign_upstream: SocketAddr,
-    mmdb: Reader<Mmap>,
+    mmdb: Reader<Vec<u8>>,
     special_suffixes: Vec<String>,
     cache: Option<DnsCache>,
     timeout: Duration,
@@ -1296,8 +1296,8 @@ async fn main() -> anyhow::Result<()> {
 
     let listen_text = config.listen.clone();
 
-    // SAFETY: The database file will not be modified while the reader exists.
-    let mmdb = unsafe { Reader::open_mmap(&config.mmdb_path) }.context("Invalid MMDB database")?;
+    let mmdb_data = tokio::fs::read(&config.mmdb_path).await?;
+    let mmdb = Reader::from_source(mmdb_data).context("Invalid MMDB database")?;
 
     // 加载 GFWList 并构建布隆过滤器
     let gfw_checker = if let Some(path) = &config.gfwlist_path {

@@ -25,5 +25,5 @@ else
 fi
 
 # 上传并重启
-rsync -avrPzz $BIN zdxlz:/usr/bin
-ssh zdxlz service tsubamegaeshi-rs restart
+rsync -avrPzz $BIN root@10.0.1.1:/usr/bin
+ssh root@10.0.1.1 service tsubamegaeshi-rs restart
