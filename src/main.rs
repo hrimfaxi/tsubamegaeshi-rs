@@ -1465,6 +1465,8 @@ async fn bind_listen_socket(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
 
         SocketAddr::V6(_) => {
             let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+            socket.set_reuse_address(true)?;
+            socket.set_reuse_port(true)?;
             socket.set_only_v6(false)?;
             socket.set_nonblocking(true)?;
             socket.bind(&addr.into())?;
