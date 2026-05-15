@@ -157,6 +157,13 @@ struct Config {
     adblock_path: Option<String>,
     /// 布隆过滤器误判率，默认 0.001
     adblock_fp_rate: Option<f64>,
+
+    #[serde(default = "default_domestic_countries")]
+    domestic_countries: Vec<String>,
+}
+
+fn default_domestic_countries() -> Vec<String> {
+    vec!["CN".to_string()]
 }
 
 struct CacheEntry {
@@ -252,6 +259,7 @@ struct DnsServer {
     mark_sites: Option<MarkSites>,
     nft_manager: Option<Arc<CommandNftManager>>,
     adblock_checker: Option<Arc<AdblockChecker>>,
+    domestic_countries: Vec<String>,
 }
 
 struct RequestContext<'a> {
@@ -808,7 +816,7 @@ impl DnsServer {
                         }
                     }) {
                         Some(ip) => {
-                            let is_cn = self.is_china_ip(ip);
+                            let is_cn = self.is_domestic_country_ip(ip);
 
                             if is_cn {
                                 debug!("[DOMESTIC-KEEP] {} ({} - China)", clean_domain, ip);
@@ -1244,13 +1252,13 @@ impl DnsServer {
         Ok(())
     }
 
-    fn is_china_ip(&self, ip: IpAddr) -> bool {
-        let result = match self.mmdb.lookup(ip) {
+    fn is_domestic_country_ip(&self, ip: IpAddr) -> bool {
+        let lookup_result = match self.mmdb.lookup(ip) {
             Ok(r) => r,
             Err(_) => return false,
         };
 
-        let country = match result.decode::<Country>() {
+        let country = match lookup_result.decode::<Country>() {
             Ok(Some(c)) => c,
             _ => return false,
         };
@@ -1258,7 +1266,11 @@ impl DnsServer {
         country
             .country
             .iso_code
-            .map(|code| code == "CN")
+            .map(|code| {
+                self.domestic_countries
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(code))
+            })
             .unwrap_or(false)
     }
 }
@@ -1450,6 +1462,7 @@ async fn main() -> anyhow::Result<()> {
         mark_sites,
         nft_manager,
         adblock_checker,
+        domestic_countries: config.domestic_countries,
     });
 
     info!("tsubamegaeshi-rs started on {}", listen_text);
