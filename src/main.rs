@@ -1190,50 +1190,79 @@ impl DnsServer {
     }
 
     async fn send_dns_query(&self, request: &[u8], upstream: &SocketAddr) -> Option<Vec<u8>> {
-        let socket = match bind_ephemeral_udp_for(upstream).await {
-            Ok(s) => s,
+        const MAX_RETRIES: u32 = 5;
+        let mut last_error: Option<(u32, String)> = None; // (attempt_number, error_msg)
 
-            Err(e) => {
-                error!("Failed to bind ephemeral socket for {}: {}", upstream, e);
-                return None;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                debug!(
+                    "Retrying DNS query to {} (attempt {}/{})",
+                    upstream, attempt, MAX_RETRIES
+                );
             }
-        };
+
+            match self.try_send_query_once(request, upstream).await {
+                Ok(resp) => return Some(resp),
+                Err(e) => {
+                    debug!(
+                        "DNS query to {} failed (attempt {}/{}): {}",
+                        upstream,
+                        attempt + 1,
+                        MAX_RETRIES + 1,
+                        e
+                    );
+                    last_error = Some((attempt + 1, e));
+                }
+            }
+        }
+
+        // 所有尝试均失败，最终输出一条 warn
+        if let Some((attempts, err)) = last_error {
+            warn!(
+                "DNS query to {} failed after {} attempt(s): {}",
+                upstream, attempts, err
+            );
+        }
+        None
+    }
+
+    /// 单次 UDP DNS 查询，不重试。成功返回响应数据，失败返回错误描述。
+    async fn try_send_query_once(
+        &self,
+        request: &[u8],
+        upstream: &SocketAddr,
+    ) -> Result<Vec<u8>, String> {
+        let socket = bind_ephemeral_udp_for(upstream)
+            .await
+            .map_err(|e| format!("bind ephemeral socket failed: {e}"))?;
 
         if let Err(e) = socket.connect(upstream).await {
-            error!("Failed to connect UDP socket to {}: {}", upstream, e);
-            return None;
+            return Err(format!("connect (UDP) unexpectedly failed: {e}"));
         }
 
         if let Err(e) = socket.send(request).await {
-            error!("Failed to send to {}: {}", upstream, e);
-            return None;
+            return Err(format!("send failed: {e}"));
         }
 
         let mut buf = [0u8; 4096];
+        let recv_result = tokio::time::timeout(self.timeout, socket.recv(&mut buf)).await;
 
-        let len = match tokio::time::timeout(self.timeout, socket.recv(&mut buf)).await {
-            Ok(Ok(len)) => len,
-
-            Ok(Err(e)) => {
-                warn!("recv error from {}: {}", upstream, e);
-                return None;
+        match recv_result {
+            Ok(Ok(len)) => {
+                let resp = buf[..len].to_vec();
+                // 校验 DNS 事务 ID
+                if request.len() >= 2 && resp.len() >= 2 && request[0..2] != resp[0..2] {
+                    return Err("response ID mismatch".to_string());
+                }
+                Ok(resp)
             }
-
-            Err(_) => {
-                warn!("Timeout waiting for response from {}", upstream);
-                return None;
+            Ok(Err(e)) => Err(format!("recv failed: {e}")),
+            Err(_elapsed) => {
+                // timeout 超时
+                Err("timeout waiting for response".to_string())
             }
-        };
-
-        let resp = buf[..len].to_vec();
-
-        // 简单校验 DNS transaction ID。
-        if request.len() >= 2 && resp.len() >= 2 && request[0..2] != resp[0..2] {
-            warn!("Mismatched DNS response ID from {}", upstream);
-            return None;
         }
-
-        Some(resp)
     }
 
     async fn forward_to_upstream(
