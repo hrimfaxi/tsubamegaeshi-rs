@@ -360,13 +360,8 @@ impl GfwlistDecoder {
                 continue;
             }
 
-            if line.starts_with("||") {
-                let rest = &line[2..];
-
-                let domain = rest
-                    .split(|c| c == '/' || c == '^' || c == '?' || c == '#')
-                    .next()
-                    .unwrap_or(rest);
+            if let Some(rest) = line.strip_prefix("||") {
+                let domain = rest.split(['/', '^', '?', '#']).next().unwrap_or(rest);
 
                 let domain = canonical_domain(domain.trim_end_matches('^'));
 
@@ -525,19 +520,16 @@ fn is_ipv6_polluted(ip: &Ipv6Addr) -> bool {
 }
 
 fn print_first_ip(resp: &[u8], tag: &str, domain: &str, upstream: &str) {
-    if let Ok(msg) = Message::from_vec(resp) {
-        if let Some(rr) = msg
+    if let Ok(msg) = Message::from_vec(resp)
+        && let Some(rr) = msg
             .answers()
             .iter()
             .find(|rr| rr.record_type() == RecordType::A || rr.record_type() == RecordType::AAAA)
-        {
-            if let Some(ip) = rr.data().and_then(|d| d.ip_addr()) {
-                info!("[{}] {} -> {} = {}", tag, domain, upstream, ip);
-                return;
-            }
-        }
+        && let Some(ip) = rr.data().and_then(|d| d.ip_addr())
+    {
+        info!("[{}] {} -> {} = {}", tag, domain, upstream, ip);
+        return;
     }
-
     warn!("[{}] {} -> {} (no A/AAAA answer)", tag, domain, upstream);
 }
 
@@ -647,7 +639,7 @@ impl DnsServer {
                 if self
                     .hosts_v6
                     .as_ref()
-                    .map_or(false, |h| h.contains_key(ctx.clean_domain))
+                    .is_some_and(|h| h.contains_key(ctx.clean_domain))
                 {
                     info!("[HOSTS-NO-A] {} (v6 only)", ctx.clean_domain);
 
@@ -674,7 +666,7 @@ impl DnsServer {
                 if self
                     .hosts_v4
                     .as_ref()
-                    .map_or(false, |h| h.contains_key(ctx.clean_domain))
+                    .is_some_and(|h| h.contains_key(ctx.clean_domain))
                 {
                     info!("[HOSTS-NO-AAAA] {} (v4 only)", ctx.clean_domain);
 
@@ -780,21 +772,21 @@ impl DnsServer {
         }
 
         // GFWList 检查：命中则直接走 foreign_upstream
-        if let Some(ref gfw) = self.gfw_checker {
-            if gfw.check(ctx.clean_domain) {
-                trace!(
-                    "[{}] {} in gfwlist, direct to foreign",
-                    ctx.kind.gfwlist_tag(),
-                    ctx.clean_domain
-                );
+        if let Some(ref gfw) = self.gfw_checker
+            && gfw.check(ctx.clean_domain)
+        {
+            trace!(
+                "[{}] {} in gfwlist, direct to foreign",
+                ctx.kind.gfwlist_tag(),
+                ctx.clean_domain
+            );
 
-                let upstream = self.foreign_upstream;
+            let upstream = self.foreign_upstream;
 
-                self.forward_and_cache(ctx, &upstream, ctx.kind.gfwlist_tag())
-                    .await;
+            self.forward_and_cache(ctx, &upstream, ctx.kind.gfwlist_tag())
+                .await;
 
-                return true;
-            }
+            return true;
         }
 
         false
@@ -939,21 +931,21 @@ impl DnsServer {
         }
 
         // 2. 广告屏蔽（新增）
-        if let Some(ref adblock) = self.adblock_checker {
-            if adblock.check(ctx.clean_domain) {
-                let blocked_response = match ctx.kind {
-                    AddressQueryKind::A => {
-                        info!("[ADBLOCK-A] {} -> 0.0.0.0", ctx.clean_domain);
-                        build_a_response(ctx.query_msg, Ipv4Addr::new(0, 0, 0, 0), 60)
-                    }
-                    AddressQueryKind::Aaaa => {
-                        info!("[ADBLOCK-AAAA] {} -> ::", ctx.clean_domain);
-                        build_aaaa_response(ctx.query_msg, Ipv6Addr::UNSPECIFIED, 60)
-                    }
-                };
-                let _ = self.socket.send_to(&blocked_response, ctx.src).await;
-                return;
-            }
+        if let Some(ref adblock) = self.adblock_checker
+            && adblock.check(ctx.clean_domain)
+        {
+            let blocked_response = match ctx.kind {
+                AddressQueryKind::A => {
+                    info!("[ADBLOCK-A] {} -> 0.0.0.0", ctx.clean_domain);
+                    build_a_response(ctx.query_msg, Ipv4Addr::new(0, 0, 0, 0), 60)
+                }
+                AddressQueryKind::Aaaa => {
+                    info!("[ADBLOCK-AAAA] {} -> ::", ctx.clean_domain);
+                    build_aaaa_response(ctx.query_msg, Ipv6Addr::UNSPECIFIED, 60)
+                }
+            };
+            let _ = self.socket.send_to(&blocked_response, ctx.src).await;
+            return;
         }
 
         // 缓存检查
@@ -1413,8 +1405,8 @@ async fn main() -> anyhow::Result<()> {
     let cache = NonZeroUsize::new(config.cache_size).map(DnsCache::new);
 
     let (hosts_v4, hosts_v6) = config.hosts.as_ref().map_or((None, None), |h| {
-        let v4 = h.ipv4.as_ref().map(|m| parse_hosts::<Ipv4Addr>(m));
-        let v6 = h.ipv6.as_ref().map(|m| parse_hosts::<Ipv6Addr>(m));
+        let v4 = h.ipv4.as_ref().map(parse_hosts::<Ipv4Addr>);
+        let v6 = h.ipv6.as_ref().map(parse_hosts::<Ipv6Addr>);
         (v4, v6)
     });
 
@@ -1463,12 +1455,12 @@ async fn main() -> anyhow::Result<()> {
     let nft_manager = mark_sites.as_ref().map(|_| Arc::new(CommandNftManager));
 
     // 初始化 nft 表与集合
-    if let Some(ref ms) = mark_sites {
-        if let Some(ref nft) = nft_manager {
-            for group in &ms.groups {
-                if let Err(e) = nft.ensure_table(&group.nft_table) {
-                    error!("Failed to ensure nft table '{}': {}", group.nft_table, e);
-                }
+    if let Some(ref ms) = mark_sites
+        && let Some(ref nft) = nft_manager
+    {
+        for group in &ms.groups {
+            if let Err(e) = nft.ensure_table(&group.nft_table) {
+                error!("Failed to ensure nft table '{}': {}", group.nft_table, e);
             }
         }
     }
@@ -1537,10 +1529,10 @@ fn validate_config(config: &Config) -> anyhow::Result<()> {
         anyhow::bail!("query_timeout_sec must be greater than 0");
     }
 
-    if let Some(rate) = config.gfbloom_fp_rate {
-        if !(rate > 0.0 && rate < 1.0) {
-            anyhow::bail!("gfbloom_fp_rate must be greater than 0.0 and less than 1.0");
-        }
+    if let Some(rate) = config.gfbloom_fp_rate
+        && !(rate > 0.0 && rate < 1.0)
+    {
+        anyhow::bail!("gfbloom_fp_rate must be greater than 0.0 and less than 1.0");
     }
 
     if let Some(marksite) = &config.marksite {
@@ -1561,10 +1553,10 @@ fn validate_config(config: &Config) -> anyhow::Result<()> {
         }
     }
 
-    if let Some(rate) = config.adblock_fp_rate {
-        if !(rate > 0.0 && rate < 1.0) {
-            anyhow::bail!("adblock_fp_rate must be between 0.0 and 1.0");
-        }
+    if let Some(rate) = config.adblock_fp_rate
+        && !(rate > 0.0 && rate < 1.0)
+    {
+        anyhow::bail!("adblock_fp_rate must be between 0.0 and 1.0");
     }
 
     Ok(())
@@ -1709,10 +1701,7 @@ impl AdblockDecoder {
 
             // 处理 ||domain^ 形式
             if let Some(rest) = line.strip_prefix("||") {
-                let domain = rest
-                    .split(|c: char| c == '^' || c == '/' || c == '?' || c == '#' || c == '*')
-                    .next()
-                    .unwrap_or(rest);
+                let domain = rest.split(['^', '/', '?', '#', '*']).next().unwrap_or(rest);
                 let domain = domain.trim();
                 if looks_like_domain(domain) {
                     domains.push(canonical_domain(domain));
@@ -1720,10 +1709,7 @@ impl AdblockDecoder {
             }
             // 处理 .example.com 形式
             else if let Some(rest) = line.strip_prefix('.') {
-                let domain = rest
-                    .split(|c: char| c == '^' || c == '/' || c == '?' || c == '#' || c == '*')
-                    .next()
-                    .unwrap_or(rest);
+                let domain = rest.split(['^', '/', '?', '#', '*']).next().unwrap_or(rest);
                 let domain = domain.trim();
                 if looks_like_domain(domain) {
                     domains.push(canonical_domain(domain));
@@ -1731,10 +1717,7 @@ impl AdblockDecoder {
             }
             // 纯域名（无修饰符），忽略带 $ 的选项规则
             else if !line.starts_with('@') && !line.contains('$') {
-                let domain = line
-                    .split(|c: char| c == '^' || c == '/' || c == '?' || c == '#')
-                    .next()
-                    .unwrap_or(line);
+                let domain = line.split(['^', '/', '?', '#']).next().unwrap_or(line);
                 let domain = domain.trim();
                 if looks_like_domain(domain) {
                     domains.push(canonical_domain(domain));
