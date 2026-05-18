@@ -414,14 +414,14 @@ impl DnsServer {
     }
 
     pub async fn handle_address_request(&self, ctx: RequestContext<'_>) {
-        if self.handle_hosts_override(&ctx).await {
-            return;
-        }
-
         // 如果禁用了 AAAA，则不查缓存、不查上游，直接返回 NODATA
         if ctx.kind == AddressQueryKind::Aaaa && !self.enable_ipv6_aaaa {
             let nodata = build_nodata_response(ctx.query_msg);
             let _ = self.socket.send_to(&nodata, ctx.src).await;
+            return;
+        }
+
+        if self.handle_hosts_override(&ctx).await {
             return;
         }
 
