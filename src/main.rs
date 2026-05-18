@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
 
-use crate::config::{Config, validate_config};
+use crate::config::Config;
 use adblock::{AdblockChecker, AdblockDecoder};
 use cache::DnsCache;
 use domain_utils::{canonical_domain, normalize_domain_list};
@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config: Config = toml::from_str(&config_str).context("Invalid config.toml")?;
 
-    validate_config(&config)?;
+    config.validate()?;
 
     let base = config
         .log_level

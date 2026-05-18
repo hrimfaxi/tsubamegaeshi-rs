@@ -51,39 +51,41 @@ fn default_domestic_countries() -> Vec<String> {
     vec!["CN".to_string()]
 }
 
-pub fn validate_config(config: &Config) -> anyhow::Result<()> {
-    if config.query_timeout_sec == 0 {
-        anyhow::bail!("query_timeout_sec must be greater than 0");
-    }
+impl Config {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.query_timeout_sec == 0 {
+            anyhow::bail!("query_timeout_sec must be greater than 0");
+        }
 
-    if let Some(rate) = config.gfbloom_fp_rate
-        && !(rate > 0.0 && rate < 1.0)
-    {
-        anyhow::bail!("gfbloom_fp_rate must be greater than 0.0 and less than 1.0");
-    }
+        if let Some(rate) = self.gfbloom_fp_rate
+            && !(rate > 0.0 && rate < 1.0)
+        {
+            anyhow::bail!("gfbloom_fp_rate must be greater than 0.0 and less than 1.0");
+        }
 
-    if let Some(marksite) = &config.marksite {
-        for table in marksite.keys() {
-            if table.is_empty() {
-                anyhow::bail!("marksite table suffix cannot be empty");
-            }
-            if !table
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-            {
-                anyhow::bail!(
-                    "invalid marksite table suffix '{}': only ASCII letters, digits, '_' and '-' are allowed",
-                    table
-                );
+        if let Some(marksite) = &self.marksite {
+            for table in marksite.keys() {
+                if table.is_empty() {
+                    anyhow::bail!("marksite table suffix cannot be empty");
+                }
+                if !table
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    anyhow::bail!(
+                        "invalid marksite table suffix '{}': only ASCII letters, digits, '_' and '-' are allowed",
+                        table
+                    );
+                }
             }
         }
-    }
 
-    if let Some(rate) = config.adblock_fp_rate
-        && !(rate > 0.0 && rate < 1.0)
-    {
-        anyhow::bail!("adblock_fp_rate must be between 0.0 and 1.0");
-    }
+        if let Some(rate) = self.adblock_fp_rate
+            && !(rate > 0.0 && rate < 1.0)
+        {
+            anyhow::bail!("adblock_fp_rate must be between 0.0 and 1.0");
+        }
 
-    Ok(())
+        Ok(())
+    }
 }
