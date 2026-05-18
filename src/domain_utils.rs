@@ -27,14 +27,31 @@ pub fn normalize_domain_list(items: Option<Vec<String>>) -> Option<Vec<String>> 
 /// 不匹配：
 /// - `badexample.com` 不应匹配 `example.com`
 pub fn domain_matches_suffix(domain: &str, suffix: &str) -> bool {
-    let domain = canonical_domain(domain);
-    let suffix = canonical_domain(suffix);
+    let d_norm = canonical_domain(domain);
+    let s_norm = canonical_domain(suffix);
 
-    if suffix.is_empty() {
+    let d_len = d_norm.len();
+    let s_len = s_norm.len();
+
+    // 2. 长度边界短路
+    if d_len < s_len {
         return false;
     }
 
-    domain == suffix || domain.ends_with(&format!(".{}", suffix))
+    // 3. 规范化后完全相等 (例如 domain: "google.com", suffix: "google.com")
+    if d_len == s_len {
+        return d_norm == s_norm;
+    }
+
+    // 4. 处理子域名后缀匹配 (例如 domain: "www.google.com", suffix: "google.com")
+    if d_norm.ends_with(&s_norm) {
+        let prev_char_idx = d_len - s_len - 1;
+        if let Some(c) = d_norm.as_bytes().get(prev_char_idx) {
+            return *c == b'.';
+        }
+    }
+
+    false
 }
 
 /// 检查域名是否匹配强制列表中的任一条目。
