@@ -54,6 +54,55 @@ pub fn domain_matches_suffix(domain: &str, suffix: &str) -> bool {
     false
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_domain_matches_suffix() {
+        // 1. 完全相等的情况
+        assert!(domain_matches_suffix("google.com", "google.com"));
+        assert!(
+            domain_matches_suffix("Google.Com", "google.com"),
+            "应该忽略大小写"
+        );
+
+        // 2. 标准子域名匹配
+        assert!(domain_matches_suffix("www.google.com", "google.com"));
+        assert!(domain_matches_suffix("mail.www.google.com", "google.com"));
+        assert!(domain_matches_suffix("a.b.c.d.google.com", "google.com"));
+
+        // 3. 相似但【不应该】匹配的情况（经典边界漏洞）
+        assert!(
+            !domain_matches_suffix("notgoogle.com", "google.com"),
+            "防止字符串部分包含的伪匹配"
+        );
+        assert!(!domain_matches_suffix("fakegoogle.com", "google.com"));
+        assert!(
+            !domain_matches_suffix("google.com.cn", "google.com"),
+            "后缀不同不应匹配"
+        );
+        assert!(
+            !domain_matches_suffix("com", "google.com"),
+            "长度不够不应匹配"
+        );
+
+        // 4. 各种恶心的 FQDN 尾部点（Trailing Dot）情况
+        // 因为入口进来了 canonical_domain，所以这些行为必须表现一致且安全
+        assert!(domain_matches_suffix("google.com.", "google.com"));
+        assert!(domain_matches_suffix("google.com", "google.com."));
+        assert!(domain_matches_suffix("google.com.", "google.com."));
+        assert!(domain_matches_suffix("www.google.com.", "google.com"));
+        assert!(domain_matches_suffix("www.google.com", "google.com."));
+        assert!(domain_matches_suffix("www.google.com.", "google.com."));
+
+        // 5. 空字符或非法边界防御
+        assert!(!domain_matches_suffix("", "google.com"));
+        assert!(!domain_matches_suffix("google.com", ""));
+        assert!(domain_matches_suffix("", ""));
+    }
+}
+
 /// 检查域名是否匹配强制列表中的任一条目。
 pub fn is_forced(domain: &str, list: &Option<Vec<String>>) -> bool {
     let Some(items) = list else {
