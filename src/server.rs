@@ -19,6 +19,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 pub struct RequestContext<'a> {
@@ -676,37 +677,44 @@ impl DnsServer {
     }
 
     pub async fn send_dns_query(&self, request: &[u8], upstream: &SocketAddr) -> Option<Vec<u8>> {
-        const MAX_RETRIES: u32 = 5;
-        let mut last_error: Option<(u32, String)> = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut attempt = 0;
+        let mut last_error: Option<String> = None;
 
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                debug!(
-                    "Retrying DNS query to {} (attempt {}/{})",
-                    upstream, attempt, MAX_RETRIES
-                );
+        loop {
+            let now = Instant::now();
+            // 如果已经超过截止时间，直接退出
+            if now >= deadline {
+                break;
             }
+
+            if attempt > 0 {
+                // 计算剩余可用时间（饱和到非负）
+                let remaining = deadline.saturating_duration_since(now);
+                // 等待至多 2 秒，但不超过剩余时间
+                let wait = std::cmp::min(remaining, Duration::from_secs(2));
+                sleep(wait).await;
+            }
+
+            attempt += 1;
+            debug!("Sending DNS query to {} (attempt {})", upstream, attempt);
 
             match self.try_send_query_once(request, upstream).await {
                 Ok(resp) => return Some(resp),
                 Err(e) => {
                     debug!(
-                        "DNS query to {} failed (attempt {}/{}): {}",
-                        upstream,
-                        attempt + 1,
-                        MAX_RETRIES + 1,
-                        e
+                        "DNS query to {} failed (attempt {}): {}",
+                        upstream, attempt, e
                     );
-                    last_error = Some((attempt + 1, e));
+                    last_error = Some(e);
                 }
             }
         }
 
-        if let Some((attempts, err)) = last_error {
+        if let Some(err) = last_error {
             warn!(
-                "DNS query to {} failed after {} attempt(s): {}",
-                upstream, attempts, err
+                "DNS query to {} failed after {} attempt(s) within 10 seconds: {}",
+                upstream, attempt, err
             );
         }
         None
