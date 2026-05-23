@@ -2,11 +2,11 @@ use crate::adblock::AdblockChecker;
 use crate::cache::DnsCache;
 use crate::dns_utils::{
     AddressQueryKind, build_a_response, build_aaaa_response, build_nodata_response,
-    build_servfail_response, is_ipv6_polluted, print_first_ip,
+    build_servfail_response, extract_https_hints, is_ipv6_polluted, print_first_ip,
 };
 use crate::domain_utils::{canonical_domain, domain_matches_suffix, is_forced};
 use crate::gfwlist::BloomDomainChecker;
-use crate::mark_sites::{CommandNftManager, MarkSites, NFT_SEM, NftManager};
+use crate::mark_sites::{CommandNftManager, MarkGroup, MarkSites, NFT_SEM, NftManager};
 use anyhow::Context;
 use hickory_proto::op::Message;
 use hickory_proto::rr::RecordType;
@@ -63,14 +63,9 @@ impl DnsServer {
         let Some(mark_sites) = &self.mark_sites else {
             return;
         };
+        let Some(nft) = &self.nft_manager else { return };
 
-        let Some(nft) = &self.nft_manager else {
-            return;
-        };
-
-        let matched_groups: Vec<&crate::mark_sites::MarkGroup> =
-            mark_sites.match_groups(clean_domain).collect();
-
+        let matched_groups: Vec<&MarkGroup> = mark_sites.match_groups(clean_domain).collect();
         if matched_groups.is_empty() {
             return;
         }
@@ -85,22 +80,24 @@ impl DnsServer {
                 .collect::<Vec<_>>()
         );
 
-        let ips: Vec<IpAddr> = match Message::from_vec(final_resp) {
-            Ok(msg) => msg
-                .answers()
-                .iter()
-                .filter_map(|rr| {
-                    if rr.record_type() == RecordType::A || rr.record_type() == RecordType::AAAA {
-                        rr.data().and_then(|d| d.ip_addr())
-                    } else {
-                        None
+        let mut ips = HashSet::new();
+        if let Ok(msg) = Message::from_vec(final_resp) {
+            for answer in msg.answers() {
+                match answer.record_type() {
+                    RecordType::A | RecordType::AAAA => {
+                        if let Some(ip) = answer.data().and_then(|d| d.ip_addr()) {
+                            ips.insert(ip);
+                        }
                     }
-                })
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect(),
-            Err(_) => vec![],
-        };
+                    RecordType::HTTPS => {
+                        for ip in extract_https_hints(answer) {
+                            ips.insert(ip);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         if ips.is_empty() {
             return;
@@ -108,9 +105,7 @@ impl DnsServer {
 
         let nft_manager = nft.clone();
         let tables: Vec<String> = matched_groups.iter().map(|g| g.nft_table.clone()).collect();
-
         let mut entries = Vec::new();
-
         for ip in &ips {
             for table in &tables {
                 entries.push((table.clone(), *ip));
@@ -124,7 +119,6 @@ impl DnsServer {
 
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-
             for (table, ip) in entries {
                 if let Err(e) = nft_manager.as_ref().add_ip_to_group(&table, ip) {
                     error!(
@@ -184,6 +178,40 @@ impl DnsServer {
                     return true;
                 }
 
+                false
+            }
+
+            AddressQueryKind::Https => {
+                let v4_hints: Vec<Ipv4Addr> = self
+                    .hosts_v4
+                    .as_ref()
+                    .and_then(|h| h.get(ctx.clean_domain))
+                    .into_iter()
+                    .copied()
+                    .collect();
+
+                let v6_hints: Vec<Ipv6Addr> = self
+                    .hosts_v6
+                    .as_ref()
+                    .and_then(|h| h.get(ctx.clean_domain))
+                    .into_iter()
+                    .copied()
+                    .collect();
+
+                if !v4_hints.is_empty() || !v6_hints.is_empty() {
+                    info!(
+                        "[HOSTS-HTTPS] {} -> custom hints IPv4: {:?}, IPv6: {:?}",
+                        ctx.clean_domain, v4_hints, v6_hints
+                    );
+                    let resp = crate::dns_utils::build_https_response(
+                        ctx.query_msg,
+                        v4_hints,
+                        v6_hints,
+                        60,
+                    );
+                    let _ = self.socket.send_to(&resp, ctx.src).await;
+                    return true;
+                }
                 false
             }
         }
@@ -313,7 +341,6 @@ impl DnsServer {
                     }) {
                         Some(ip) => {
                             let is_cn = self.is_domestic_country_ip(ip);
-
                             if is_cn {
                                 debug!("[DOMESTIC-KEEP] {} ({} - China)", clean_domain, ip);
                                 true
@@ -325,14 +352,12 @@ impl DnsServer {
                                 false
                             }
                         }
-
                         None => {
                             debug!("[DOMESTIC-NO-IP] {} -> foreign", clean_domain);
                             false
                         }
                     }
                 }
-
                 Err(e) => {
                     warn!(
                         "Failed to parse domestic response for {}: {}",
@@ -341,7 +366,6 @@ impl DnsServer {
                     false
                 }
             },
-
             None => {
                 warn!("[DOMESTIC-TIMEOUT] {} -> foreign", clean_domain);
                 false
@@ -410,6 +434,9 @@ impl DnsServer {
             AddressQueryKind::Aaaa => {
                 self.should_use_domestic_aaaa_response(clean_domain, domestic_resp)
             }
+            AddressQueryKind::Https => {
+                self.should_use_domestic_https_response(clean_domain, domestic_resp)
+            }
         }
     }
 
@@ -421,11 +448,12 @@ impl DnsServer {
             return;
         }
 
+        // Hosts 覆盖
         if self.handle_hosts_override(&ctx).await {
             return;
         }
 
-        // 2. 广告屏蔽（新增）
+        // 广告屏蔽：HTTPS 查询返回 NODATA
         if let Some(ref adblock) = self.adblock_checker
             && adblock.check(ctx.clean_domain)
         {
@@ -437,6 +465,10 @@ impl DnsServer {
                 AddressQueryKind::Aaaa => {
                     info!("[ADBLOCK-AAAA] {} -> ::", ctx.clean_domain);
                     build_aaaa_response(ctx.query_msg, Ipv6Addr::UNSPECIFIED, 60)
+                }
+                AddressQueryKind::Https => {
+                    info!("[ADBLOCK-HTTPS] {} -> NODATA", ctx.clean_domain);
+                    build_nodata_response(ctx.query_msg)
                 }
             };
             let _ = self.socket.send_to(&blocked_response, ctx.src).await;
@@ -659,6 +691,17 @@ impl DnsServer {
                 self.handle_address_request(ctx).await;
             }
 
+            RecordType::HTTPS => {
+                let ctx = RequestContext {
+                    kind: AddressQueryKind::Https,
+                    request: &request,
+                    query_msg: &query_msg,
+                    clean_domain: &clean_domain,
+                    src,
+                };
+                self.handle_address_request(ctx).await;
+            }
+
             _ => {
                 debug!("[NON-A] {} type={:?} -> domestic", clean_domain, qtype);
 
@@ -789,6 +832,65 @@ impl DnsServer {
                     .any(|c| c.eq_ignore_ascii_case(code))
             })
             .unwrap_or(false)
+    }
+
+    pub fn should_use_domestic_https_response(
+        &self,
+        clean_domain: &str,
+        domestic_resp: &Option<Vec<u8>>,
+    ) -> bool {
+        match domestic_resp {
+            Some(data) => {
+                if let Ok(msg) = Message::from_vec(data) {
+                    let mut all_hints = Vec::new();
+                    for answer in msg.answers() {
+                        if answer.record_type() == RecordType::HTTPS {
+                            all_hints.extend(extract_https_hints(answer));
+                        }
+                    }
+                    if all_hints.is_empty() {
+                        debug!("[DOMESTIC-HTTPS] {} no hints -> keep", clean_domain);
+                        return true;
+                    } else {
+                        debug!(
+                            "[HTTPS-DEBUG] {} domestic hints: {:?}",
+                            clean_domain, all_hints
+                        );
+                    }
+                    for ip in all_hints {
+                        match ip {
+                            IpAddr::V4(v4) => {
+                                if !self.is_domestic_country_ip(ip) {
+                                    debug!(
+                                        "[DOMESTIC-HTTPS-REJECT] {} IPv4 {} not domestic -> foreign",
+                                        clean_domain, v4
+                                    );
+                                    return false;
+                                }
+                            }
+                            IpAddr::V6(v6) => {
+                                if is_ipv6_polluted(&v6) || !self.is_domestic_country_ip(ip) {
+                                    debug!(
+                                        "[DOMESTIC-HTTPS-REJECT] {} IPv6 {} polluted/not domestic -> foreign",
+                                        clean_domain, v6
+                                    );
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    debug!("[DOMESTIC-HTTPS-KEEP] {} all hints domestic", clean_domain);
+                    true
+                } else {
+                    debug!("[DOMESTIC-HTTPS-PARSE-ERR] {} -> foreign", clean_domain);
+                    false
+                }
+            }
+            None => {
+                debug!("[DOMESTIC-HTTPS-TIMEOUT] {} -> foreign", clean_domain);
+                false
+            }
+        }
     }
 }
 
