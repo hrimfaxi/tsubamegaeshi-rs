@@ -12,7 +12,7 @@ maxminddb = { version = "0.28.1", features = ["simdutf8"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 lru = "0.12"
-tracing = { version = "0.1", features = ["release_max_level_info"] }
+tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
 anyhow = "1"
 socket2 = "0.6.3"
