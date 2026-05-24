@@ -25,6 +25,16 @@ gfwlist_path = "/etc/tsubamegaeshi-rs/gfwlist.txt"
 mmdb_path = "/etc/tsubamegaeshi-rs/Country-only-cn-private.mmdb"
 gfbloom_fp_rate = 0.001
 
+# 污染 IPv4 地址列表文件路径
+ipv4_list = "/etc/tsubamegaeshi-rs/ipv4.txt"
+
+# 污染 IPv6 地址列表文件路径
+ipv6_list = "/etc/tsubamegaeshi-rs/ipv6.txt"
+
+# 国外 DNS 查询时最多丢弃多少个污染包后才放弃，默认 5
+# 0 表示放弃污染检查
+max_polluted_packets = 5
+
 force_foreign_domains = [
   "syncthing.net",
 ]

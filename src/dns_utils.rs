@@ -2,8 +2,10 @@ use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::rdata::svcb::{IpHint, SVCB, SvcParamKey, SvcParamValue};
 use hickory_proto::rr::rdata::{A as ARecord, AAAA as AAAARecord};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use tracing::{info, warn};
+
+use crate::pollution::extract_answer_ips;
 
 pub const DNS_TYPE_A: u16 = 1;
 pub const DNS_TYPE_AAAA: u16 = 28;
@@ -86,14 +88,6 @@ impl AddressQueryKind {
             AddressQueryKind::A => "FOREIGN",
             AddressQueryKind::Aaaa => "FOREIGN-AAAA",
             AddressQueryKind::Https => "FOREIGN-HTTPS",
-        }
-    }
-
-    pub fn foreign_timeout_tag(self) -> &'static str {
-        match self {
-            AddressQueryKind::A => "FOREIGN-TIMEOUT",
-            AddressQueryKind::Aaaa => "FOREIGN-TIMEOUT-AAAA",
-            AddressQueryKind::Https => "FOREIGN-TIMEOUT-HTTPS",
         }
     }
 }
@@ -228,73 +222,15 @@ pub fn rewrite_dns_id(data: &mut [u8], id: u16) {
     }
 }
 
-/// 检测 IPv6 地址是否为已知 GFW 污染地址，例如 `2001::xxxx:yyyy`
-pub fn is_ipv6_polluted(ip: &Ipv6Addr) -> bool {
-    let bytes = ip.octets();
-
-    if bytes[0] != 0x20 || bytes[1] != 0x01 {
-        return false;
-    }
-
-    bytes[2..12].iter().all(|&b| b == 0)
-}
-
-pub fn extract_https_hints(answer: &Record) -> Vec<IpAddr> {
-    if answer.record_type() != RecordType::HTTPS {
-        return vec![];
-    }
-    if let Some(RData::SVCB(svcb)) = answer.data() {
-        let mut ips = Vec::new();
-        for (key, value) in svcb.svc_params() {
-            match key {
-                SvcParamKey::Ipv4Hint => {
-                    if let SvcParamValue::Ipv4Hint(addrs) = value {
-                        for a in addrs.0.iter() {
-                            ips.push(IpAddr::V4(a.0));
-                        }
-                    }
-                }
-                SvcParamKey::Ipv6Hint => {
-                    if let SvcParamValue::Ipv6Hint(addrs) = value {
-                        for a in addrs.0.iter() {
-                            ips.push(IpAddr::V6(a.0));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        ips
-    } else {
-        vec![]
-    }
-}
-
 pub fn print_first_ip(resp: &[u8], tag: &str, domain: &str, upstream: &str) {
-    if let Ok(msg) = Message::from_vec(resp) {
-        // 优先打印 A/AAAA
-        if let Some(rr) = msg
-            .answers()
-            .iter()
-            .find(|rr| rr.record_type() == RecordType::A || rr.record_type() == RecordType::AAAA)
-            .and_then(|rr| rr.data().and_then(|d| d.ip_addr()))
-        {
-            info!("[{}] {} -> {} = {}", tag, domain, upstream, rr);
-            return;
-        }
-        // 否则打印 HTTPS 的第一个 hint
-        if let Some(rr) = msg
-            .answers()
-            .iter()
-            .find(|rr| rr.record_type() == RecordType::HTTPS)
-        {
-            let hints = extract_https_hints(rr);
-            if let Some(ip) = hints.first() {
-                info!("[{}] {} -> {} HTTPS hint: {}", tag, domain, upstream, ip);
-                return;
-            }
-        }
+    // 统一从原始字节提取所有 IP（A/AAAA/HTTPS hints），取第一个打印
+    if let Ok(ips) = extract_answer_ips(resp)
+        && let Some(ip) = ips.first()
+    {
+        info!("[{}] {} -> {} = {}", tag, domain, upstream, ip);
+        return;
     }
+
     warn!(
         "[{}] {} -> {} (no A/AAAA/HTTPS answer)",
         tag, domain, upstream

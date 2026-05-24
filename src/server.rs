@@ -1,14 +1,5 @@
-use crate::adblock::AdblockChecker;
-use crate::cache::DnsCache;
-use crate::dns_utils::{
-    AddressQueryKind, build_a_response, build_aaaa_response, build_nodata_response,
-    build_servfail_response, extract_https_hints, is_ipv6_polluted, print_first_ip,
-};
-use crate::domain_utils::{canonical_domain, domain_matches_suffix, is_forced};
-use crate::gfwlist::BloomDomainChecker;
-use crate::mark_sites::{CommandNftManager, MarkGroup, MarkSites, NFT_SEM, NftManager};
 use anyhow::Context;
-use hickory_proto::op::Message;
+use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::RecordType;
 use maxminddb::Reader;
 use maxminddb::geoip2::Country;
@@ -19,8 +10,19 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout_at};
 use tracing::{debug, error, info, trace, warn};
+
+use crate::adblock::AdblockChecker;
+use crate::cache::DnsCache;
+use crate::dns_utils::{
+    AddressQueryKind, build_a_response, build_aaaa_response, build_nodata_response,
+    build_servfail_response, print_first_ip,
+};
+use crate::domain_utils::{canonical_domain, domain_matches_suffix, is_forced};
+use crate::gfwlist::BloomDomainChecker;
+use crate::mark_sites::{CommandNftManager, MarkGroup, MarkSites, NFT_SEM, NftManager};
+use crate::pollution::{PollutionChecker, PollutionResult, extract_answer_ips};
 
 pub struct RequestContext<'a> {
     pub kind: AddressQueryKind,
@@ -49,6 +51,7 @@ pub struct DnsServer {
     pub nft_manager: Option<Arc<CommandNftManager>>,
     pub adblock_checker: Option<Arc<AdblockChecker>>,
     pub domestic_countries: Vec<String>,
+    pub pollution_checker: Option<PollutionChecker>,
 }
 
 async fn bind_ephemeral_udp_for(upstream: &SocketAddr) -> std::io::Result<UdpSocket> {
@@ -59,6 +62,119 @@ async fn bind_ephemeral_udp_for(upstream: &SocketAddr) -> std::io::Result<UdpSoc
 }
 
 impl DnsServer {
+    /// 国外上游专用：一次发送，循环接收，污染检测
+    /// 语义：最多丢弃 `checker.max_packets` 个污染包，遇到干净包立刻返回
+    /// ID 不匹配或解析失败的包直接丢弃，不计入污染额度
+    async fn foreign_query(
+        &self,
+        request: &[u8],
+        query: &Message,
+        upstream: &SocketAddr,
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let checker = match self.pollution_checker.as_ref() {
+            Some(c) if c.max_packets > 0 => c,
+            _ => {
+                return self
+                    .query_upstream_or_servfail(request, query, upstream, None)
+                    .await;
+            }
+        };
+
+        if request.len() < 2 {
+            error!("Foreign multiple recv: request too short (< 2 bytes)");
+            return build_servfail_response(query);
+        }
+
+        let socket = match bind_ephemeral_udp_for(upstream).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Foreign multiple recv: bind failed: {}", e);
+                return build_servfail_response(query);
+            }
+        };
+        if let Err(e) = socket.connect(upstream).await {
+            error!("Foreign multiple recv: connect failed: {}", e);
+            return build_servfail_response(query);
+        }
+        if let Err(e) = socket.send(request).await {
+            error!("Foreign multiple recv: send failed: {}", e);
+            return build_servfail_response(query);
+        }
+
+        let mut buf = [0u8; 4096];
+        let deadline = tokio::time::Instant::now() + timeout;
+        let req_id = u16::from_be_bytes([request[0], request[1]]);
+        let mut polluted_count = 0;
+        let mut recv_count = 0;
+        let max_total_packets = checker.max_packets.saturating_mul(4).max(16);
+
+        loop {
+            let recv_fut = socket.recv(&mut buf);
+            match timeout_at(deadline, recv_fut).await {
+                Ok(Ok(len)) => {
+                    recv_count += 1;
+                    if recv_count > max_total_packets {
+                        warn!(
+                            "recv max total {} reached, returning SERVFAIL",
+                            max_total_packets
+                        );
+                        return build_servfail_response(query);
+                    }
+
+                    if len < 2 {
+                        debug!("recv #{}: too short", recv_count);
+                        continue;
+                    }
+
+                    let resp_id = u16::from_be_bytes([buf[0], buf[1]]);
+                    if resp_id != req_id {
+                        debug!("recv #{}: id mismatch", recv_count);
+                        continue;
+                    }
+
+                    let data = buf[..len].to_vec();
+                    match checker.check(&data) {
+                        PollutionResult::Clean => {
+                            debug!(
+                                "recv #{}: clean (after {} polluted)",
+                                recv_count, polluted_count
+                            );
+                            return data;
+                        }
+                        PollutionResult::Invalid => {
+                            warn!("recv #{}: invalid packet", recv_count);
+                            continue;
+                        }
+                        PollutionResult::Polluted => {
+                            polluted_count += 1;
+                            if polluted_count >= checker.max_packets {
+                                warn!(
+                                    "recv #{}: polluted (max {} reached), returning SERVFAIL",
+                                    recv_count, checker.max_packets
+                                );
+                                return build_servfail_response(query);
+                            }
+                            debug!(
+                                "recv #{}: polluted ({}/{})",
+                                recv_count, polluted_count, checker.max_packets
+                            );
+                            continue;
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!("recv error after {} packets: {}", recv_count, e);
+                    return build_servfail_response(query);
+                }
+                Err(_) => {
+                    warn!("timeout after {} packets, returning SERVFAIL", recv_count);
+                    return build_servfail_response(query);
+                }
+            }
+        }
+    }
+
     pub async fn apply_mark_sites(&self, final_resp: &[u8], clean_domain: &str) {
         let Some(mark_sites) = &self.mark_sites else {
             return;
@@ -81,21 +197,11 @@ impl DnsServer {
         );
 
         let mut ips = HashSet::new();
-        if let Ok(msg) = Message::from_vec(final_resp) {
-            for answer in msg.answers() {
-                match answer.record_type() {
-                    RecordType::A | RecordType::AAAA => {
-                        if let Some(ip) = answer.data().and_then(|d| d.ip_addr()) {
-                            ips.insert(ip);
-                        }
-                    }
-                    RecordType::HTTPS => {
-                        for ip in extract_https_hints(answer) {
-                            ips.insert(ip);
-                        }
-                    }
-                    _ => {}
-                }
+        if let Ok(_msg) = Message::from_vec(final_resp)
+            && let Ok(all_ips) = extract_answer_ips(final_resp)
+        {
+            for ip in all_ips {
+                ips.insert(ip);
             }
         }
 
@@ -258,6 +364,27 @@ impl DnsServer {
         .await;
     }
 
+    /// 向国外上游查询，打印日志，并按条件缓存和打标，最后回复客户端
+    async fn forward_foreign_cached(&self, ctx: &RequestContext<'_>, tag: &str) {
+        let upstream = &self.foreign_upstream;
+        let resp = self
+            .foreign_query(ctx.request, ctx.query_msg, upstream, self.timeout)
+            .await;
+
+        print_first_ip(&resp, tag, ctx.clean_domain, &upstream.to_string());
+
+        // 只有 NoError 的响应才缓存和打标
+        self.cache_and_mark_if_ok(
+            &resp,
+            ctx.clean_domain,
+            ctx.kind.cache_qtype(),
+            ctx.kind.cache_skip_tag(),
+        )
+        .await;
+
+        let _ = self.socket.send_to(&resp, ctx.src).await;
+    }
+
     pub async fn forward_by_static_rules(&self, ctx: &RequestContext<'_>) -> bool {
         for suffix in &self.special_suffixes {
             if domain_matches_suffix(ctx.clean_domain, suffix) {
@@ -298,8 +425,7 @@ impl DnsServer {
                 self.foreign_upstream
             );
 
-            let upstream = self.foreign_upstream;
-            self.forward_and_cache(ctx, &upstream, ctx.kind.force_foreign_tag())
+            self.forward_foreign_cached(ctx, ctx.kind.force_foreign_tag())
                 .await;
 
             return true;
@@ -314,10 +440,8 @@ impl DnsServer {
                 ctx.clean_domain
             );
 
-            let upstream = self.foreign_upstream;
-            self.forward_and_cache(ctx, &upstream, ctx.kind.gfwlist_tag())
+            self.forward_foreign_cached(ctx, ctx.kind.gfwlist_tag())
                 .await;
-
             return true;
         }
 
@@ -340,6 +464,20 @@ impl DnsServer {
                         }
                     }) {
                         Some(ip) => {
+                            if let IpAddr::V4(v4) = ip {
+                                let v4_polluted = self
+                                    .pollution_checker
+                                    .as_ref()
+                                    .map(|c| c.is_ipv4_polluted(&v4))
+                                    .unwrap_or(false);
+                                if v4_polluted {
+                                    debug!(
+                                        "[DOMESTIC-POLLUTED] {} {} -> foreign",
+                                        clean_domain, ip
+                                    );
+                                    return false;
+                                }
+                            }
                             let is_cn = self.is_domestic_country_ip(ip);
                             if is_cn {
                                 debug!("[DOMESTIC-KEEP] {} ({} - China)", clean_domain, ip);
@@ -391,7 +529,12 @@ impl DnsServer {
 
                     match first_ipv6 {
                         Some(IpAddr::V6(ipv6)) => {
-                            if is_ipv6_polluted(&ipv6) {
+                            let ipv6_polluted = self
+                                .pollution_checker
+                                .as_ref()
+                                .map(|c| c.is_ipv6_polluted(&ipv6))
+                                .unwrap_or(false);
+                            if ipv6_polluted {
                                 debug!(
                                     "[DOMESTIC-POLLUTED-AAAA] {} ({}) -> foreign",
                                     clean_domain, ipv6
@@ -518,14 +661,13 @@ impl DnsServer {
             )
         } else {
             let resp = self
-                .query_upstream_or_servfail(
+                .foreign_query(
                     ctx.request,
                     ctx.query_msg,
                     &self.foreign_upstream,
-                    Some((ctx.kind.foreign_timeout_tag(), ctx.clean_domain)),
+                    self.timeout,
                 )
                 .await;
-
             (
                 resp,
                 ctx.kind.foreign_tag(),
@@ -535,10 +677,10 @@ impl DnsServer {
 
         print_first_ip(&final_resp, chosen_tag, ctx.clean_domain, &chosen_upstream);
 
-        self.cache_response(
+        self.cache_and_mark_if_ok(
+            &final_resp,
             ctx.clean_domain,
             ctx.kind.cache_qtype(),
-            &final_resp,
             ctx.kind.cache_skip_tag(),
         )
         .await;
@@ -841,13 +983,8 @@ impl DnsServer {
     ) -> bool {
         match domestic_resp {
             Some(data) => {
-                if let Ok(msg) = Message::from_vec(data) {
-                    let mut all_hints = Vec::new();
-                    for answer in msg.answers() {
-                        if answer.record_type() == RecordType::HTTPS {
-                            all_hints.extend(extract_https_hints(answer));
-                        }
-                    }
+                if let Ok(_msg) = Message::from_vec(data) {
+                    let all_hints = extract_answer_ips(data).unwrap_or_default();
                     if all_hints.is_empty() {
                         debug!("[DOMESTIC-HTTPS] {} no hints -> keep", clean_domain);
                         return true;
@@ -860,7 +997,12 @@ impl DnsServer {
                     for ip in all_hints {
                         match ip {
                             IpAddr::V4(v4) => {
-                                if !self.is_domestic_country_ip(ip) {
+                                let v4_polluted = self
+                                    .pollution_checker
+                                    .as_ref()
+                                    .map(|c| c.is_ipv4_polluted(&v4))
+                                    .unwrap_or(false);
+                                if v4_polluted || !self.is_domestic_country_ip(ip) {
                                     debug!(
                                         "[DOMESTIC-HTTPS-REJECT] {} IPv4 {} not domestic -> foreign",
                                         clean_domain, v4
@@ -869,7 +1011,12 @@ impl DnsServer {
                                 }
                             }
                             IpAddr::V6(v6) => {
-                                if is_ipv6_polluted(&v6) || !self.is_domestic_country_ip(ip) {
+                                let v6_polluted = self
+                                    .pollution_checker
+                                    .as_ref()
+                                    .map(|c| c.is_ipv6_polluted(&v6))
+                                    .unwrap_or(false);
+                                if v6_polluted || !self.is_domestic_country_ip(ip) {
                                     debug!(
                                         "[DOMESTIC-HTTPS-REJECT] {} IPv6 {} polluted/not domestic -> foreign",
                                         clean_domain, v6
@@ -890,6 +1037,16 @@ impl DnsServer {
                 debug!("[DOMESTIC-HTTPS-TIMEOUT] {} -> foreign", clean_domain);
                 false
             }
+        }
+    }
+
+    /// 如果响应成功，则写入缓存并执行 mark_sites
+    async fn cache_and_mark_if_ok(&self, resp: &[u8], domain: &str, qtype: u16, skip_tag: &str) {
+        if let Ok(msg) = Message::from_vec(resp)
+            && msg.response_code() == ResponseCode::NoError
+        {
+            self.cache_response(domain, qtype, resp, skip_tag).await;
+            self.apply_mark_sites(resp, domain).await;
         }
     }
 }

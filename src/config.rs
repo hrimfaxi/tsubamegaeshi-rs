@@ -45,10 +45,35 @@ pub struct Config {
 
     #[serde(default = "default_domestic_countries")]
     pub domestic_countries: Vec<String>,
+
+    /// 污染 IPv4 地址列表文件路径
+    #[serde(default = "default_ipv4_list_path")]
+    pub ipv4_list: String,
+
+    /// 污染 IPv6 地址列表文件路径
+    #[serde(default = "default_ipv6_list_path")]
+    pub ipv6_list: String,
+
+    /// 国外 DNS 查询时最多丢弃多少个污染包后才放弃，默认 5
+    /// 0 表示放弃污染检查
+    #[serde(default = "default_max_polluted_packets")]
+    pub max_polluted_packets: usize,
 }
 
 fn default_domestic_countries() -> Vec<String> {
     vec!["CN".to_string()]
+}
+
+fn default_ipv4_list_path() -> String {
+    "/etc/tsubamegaeshi-rs/ipv4.txt".to_string()
+}
+
+fn default_ipv6_list_path() -> String {
+    "/etc/tsubamegaeshi-rs/ipv6.txt".to_string()
+}
+
+fn default_max_polluted_packets() -> usize {
+    5
 }
 
 impl Config {

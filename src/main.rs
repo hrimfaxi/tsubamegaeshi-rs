@@ -5,23 +5,28 @@ mod dns_utils;
 mod domain_utils;
 mod gfwlist;
 mod mark_sites;
+mod pollution;
 mod server;
 
 use anyhow::Context;
 use clap::Parser;
 use maxminddb::Reader;
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use crate::config::Config;
 use adblock::{AdblockChecker, AdblockDecoder};
 use cache::DnsCache;
+use config::Config;
 use domain_utils::{canonical_domain, normalize_domain_list};
 use gfwlist::{BloomDomainChecker, GfwlistDecoder};
 use mark_sites::{CommandNftManager, MarkGroup, MarkRule, MarkSites, NFT_TABLE_PREFIX};
+use pollution::PollutionChecker;
 use server::{DnsServer, bind_listen_socket, parse_hosts, parse_upstream};
 
 #[derive(Parser)]
@@ -61,6 +66,27 @@ async fn main() -> anyhow::Result<()> {
 
     let mmdb_data = tokio::fs::read(&config.mmdb_path).await?;
     let mmdb = Reader::from_source(mmdb_data).context("Invalid MMDB database")?;
+
+    // 构造污染检测器：max_polluted_packets = 0 表示关闭
+    let pollution_checker = if config.max_polluted_packets > 0 {
+        // 加载污染IP 列表
+        let ipv4_path = config.ipv4_list.clone();
+        let ipv6_path = config.ipv6_list.clone();
+        let (polluted_v4, polluted_v6) = tokio::task::spawn_blocking(move || {
+            let v4 = load_ip_set(&ipv4_path, |s| s.parse::<Ipv4Addr>().ok());
+            let v6 = load_ip_set(&ipv6_path, |s| s.parse::<Ipv6Addr>().ok());
+            (v4, v6)
+        })
+        .await?;
+
+        Some(PollutionChecker {
+            v4: polluted_v4,
+            v6: polluted_v6,
+            max_packets: config.max_polluted_packets,
+        })
+    } else {
+        None
+    };
 
     // 加载 GFWList 并构建布隆过滤器
     let gfw_checker = if let Some(path) = &config.gfwlist_path {
@@ -214,6 +240,7 @@ async fn main() -> anyhow::Result<()> {
         nft_manager,
         adblock_checker,
         domestic_countries: config.domestic_countries,
+        pollution_checker,
     });
 
     info!("tsubamegaeshi-rs started on {}", listen_text);
@@ -221,4 +248,37 @@ async fn main() -> anyhow::Result<()> {
     server.run().await;
 
     Ok(())
+}
+
+/// 从文件中逐行加载 IP 集合（取首 token，支持 # 注释）
+fn load_ip_set<F, T>(path: &str, parser: F) -> HashSet<T>
+where
+    F: Fn(&str) -> Option<T>,
+    T: Eq + std::hash::Hash,
+{
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("Cannot open IP list {}: {}", path, e);
+            return HashSet::new();
+        }
+    };
+    let reader = BufReader::new(file);
+    let mut set = HashSet::new();
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let no_comment = trimmed.split('#').next().unwrap_or("").trim();
+        let token = no_comment.split_whitespace().next().unwrap_or("");
+        if let Some(ip) = parser(token) {
+            set.insert(ip);
+        }
+    }
+    set
 }
