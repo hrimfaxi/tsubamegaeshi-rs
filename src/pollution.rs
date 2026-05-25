@@ -53,9 +53,65 @@ impl PollutionChecker {
 }
 
 /// 检测 IPv6 地址是否为已知 GFW 污染地址（前缀 2001:: 且中间 10 字节全零）
-fn is_gfw_ipv6(ip: &Ipv6Addr) -> bool {
+fn is_gfw_ipv6_legacy(ip: &Ipv6Addr) -> bool {
     let bytes = ip.octets();
     bytes.starts_with(&[0x20, 0x01]) && bytes[2..12].iter().all(|&b| b == 0)
+}
+
+/// 新式 GFW 污染：借用 Meta 前缀 2a03:2880，但后 64 位固定为 face:b00c:0:25de
+/// 中间两段 (seg[2] << 16 | seg[3]) 必须是以下 30 个精确值之一。
+/// 数组已按升序排列，供 binary_search 直接使用。
+/// 加入新的地址一定要排序
+const FB_COMBOS: [u32; 30] = [
+    0xf102_0183,
+    0xf107_0083,
+    0xf10a_0083,
+    0xf10c_0083,
+    0xf10c_0283,
+    0xf10d_0083,
+    0xf10d_0183,
+    0xf10e_0083,
+    0xf10f_0083,
+    0xf111_0083,
+    0xf112_0083,
+    0xf117_0083,
+    0xf11a_0083,
+    0xf11b_0083,
+    0xf11c_8083,
+    0xf11c_8183,
+    0xf11f_0083,
+    0xf126_0083,
+    0xf127_0083,
+    0xf127_0283,
+    0xf129_0083,
+    0xf12a_0083,
+    0xf12c_0083,
+    0xf12c_0183,
+    0xf12d_0083,
+    0xf130_0083,
+    0xf131_0083,
+    0xf134_0083,
+    0xf134_0183,
+    0xf136_0083,
+];
+
+fn is_gfw_ipv6_facebook(ip: &Ipv6Addr) -> bool {
+    let s = ip.segments();
+    if s[0] != 0x2a03
+        || s[1] != 0x2880
+        || s[4] != 0xface
+        || s[5] != 0xb00c
+        || s[6] != 0x0000
+        || s[7] != 0x25de
+    {
+        return false;
+    }
+    let key = ((s[2] as u32) << 16) | (s[3] as u32);
+    FB_COMBOS.binary_search(&key).is_ok()
+}
+
+pub fn is_gfw_ipv6(ip: &Ipv6Addr) -> bool {
+    is_gfw_ipv6_facebook(ip) || is_gfw_ipv6_legacy(ip)
 }
 
 // === DNS 类型常量 ===
@@ -590,5 +646,60 @@ mod tests {
             max_packets: 5,
         };
         assert!(!checker.is_ipv6_polluted(&ip));
+    }
+
+    #[test]
+    fn test_is_gfw_ipv6_facebook_exact_match() {
+        let known = vec![
+            "2a03:2880:f102:183:face:b00c:0:25de",
+            "2a03:2880:f107:83:face:b00c:0:25de",
+            "2a03:2880:f10a:83:face:b00c:0:25de",
+            "2a03:2880:f10c:283:face:b00c:0:25de",
+            "2a03:2880:f10c:83:face:b00c:0:25de",
+            "2a03:2880:f10d:183:face:b00c:0:25de",
+            "2a03:2880:f10d:83:face:b00c:0:25de",
+            "2a03:2880:f10e:83:face:b00c:0:25de",
+            "2a03:2880:f10f:83:face:b00c:0:25de",
+            "2a03:2880:f111:83:face:b00c:0:25de",
+            "2a03:2880:f112:83:face:b00c:0:25de",
+            "2a03:2880:f117:83:face:b00c:0:25de",
+            "2a03:2880:f11a:83:face:b00c:0:25de",
+            "2a03:2880:f11b:83:face:b00c:0:25de",
+            "2a03:2880:f11c:8083:face:b00c:0:25de",
+            "2a03:2880:f11c:8183:face:b00c:0:25de",
+            "2a03:2880:f11f:83:face:b00c:0:25de",
+            "2a03:2880:f126:83:face:b00c:0:25de",
+            "2a03:2880:f127:283:face:b00c:0:25de",
+            "2a03:2880:f127:83:face:b00c:0:25de",
+            "2a03:2880:f129:83:face:b00c:0:25de",
+            "2a03:2880:f12a:83:face:b00c:0:25de",
+            "2a03:2880:f12c:183:face:b00c:0:25de",
+            "2a03:2880:f12c:83:face:b00c:0:25de",
+            "2a03:2880:f12d:83:face:b00c:0:25de",
+            "2a03:2880:f130:83:face:b00c:0:25de",
+            "2a03:2880:f131:83:face:b00c:0:25de",
+            "2a03:2880:f134:183:face:b00c:0:25de",
+            "2a03:2880:f134:83:face:b00c:0:25de",
+            "2a03:2880:f136:83:face:b00c:0:25de",
+        ];
+        for s in known {
+            let ip: Ipv6Addr = s.parse().unwrap();
+            assert!(is_gfw_ipv6_facebook(&ip), "Failed to match {}", s);
+        }
+
+        // 额外测试附近但不在列表中的地址
+        let near_misses = vec![
+            "2a03:2880:f101:83:face:b00c:0:25de",  // seg2=f101 (比f102小)
+            "2a03:2880:f102:83:face:b00c:0:25de", // seg2正确，但seg3=83（应匹配f102:183，不匹配83）
+            "2a03:2880:f103:83:face:b00c:0:25de", // f103:83
+            "2a03:2880:f104:183:face:b00c:0:25de", // 完全不在列表
+            "2a03:2880:f11c:83:face:b00c:0:25de", // f11c:83 (列表中是f11c:8083和8183)
+            "2a03:2880:f11c:183:face:b00c:0:25de", // 不在列表
+            "2a03:2880:f12f:83:face:b00c:0:25de", // f12f不在列表 (f130是最小)
+        ];
+        for miss in near_misses {
+            let ip: Ipv6Addr = miss.parse().unwrap();
+            assert!(!is_gfw_ipv6_facebook(&ip), "Should not match {}", miss);
+        }
     }
 }
