@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         let (polluted_v4, polluted_v6) = tokio::task::spawn_blocking(move || {
             let v4 = load_ip_set(&ipv4_path, |s| s.parse::<Ipv4Addr>().ok());
             let v6 = load_ip_set(&ipv6_path, |s| s.parse::<Ipv6Addr>().ok());
+            info!("Pollution ipset loaded. ipv4={}, ipv6={}", v4.len(), v6.len());
             (v4, v6)
         })
         .await?;
