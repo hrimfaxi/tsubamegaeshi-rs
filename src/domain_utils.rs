@@ -101,6 +101,177 @@ mod tests {
         assert!(!domain_matches_suffix("google.com", ""));
         assert!(domain_matches_suffix("", ""));
     }
+
+    // ========== canonical_domain ==========
+
+    #[test]
+    fn test_canonical_domain_lowercase() {
+        assert_eq!(canonical_domain("Example.COM"), "example.com");
+    }
+
+    #[test]
+    fn test_canonical_domain_leading_dot() {
+        assert_eq!(canonical_domain(".example.com"), "example.com");
+    }
+
+    #[test]
+    fn test_canonical_domain_trailing_dot() {
+        assert_eq!(canonical_domain("example.com."), "example.com");
+    }
+
+    #[test]
+    fn test_canonical_domain_both_dots_and_case() {
+        assert_eq!(canonical_domain(".Example.COM."), "example.com");
+    }
+
+    #[test]
+    fn test_canonical_domain_empty() {
+        assert_eq!(canonical_domain(""), "");
+    }
+
+    #[test]
+    fn test_canonical_domain_only_dot() {
+        assert_eq!(canonical_domain("."), "");
+    }
+
+    // ========== normalize_domain_list ==========
+
+    #[test]
+    fn test_normalize_domain_list_none() {
+        assert_eq!(normalize_domain_list(None), None);
+    }
+
+    #[test]
+    fn test_normalize_domain_list_empty() {
+        assert_eq!(normalize_domain_list(Some(vec![])), None);
+    }
+
+    #[test]
+    fn test_normalize_domain_list_normalizes_and_filters() {
+        let input = Some(vec![
+            "Example.COM".to_string(),
+            ".test.org.".to_string(),
+            "".to_string(),
+        ]);
+        let expected = Some(vec!["example.com".to_string(), "test.org".to_string()]);
+        assert_eq!(normalize_domain_list(input), expected);
+    }
+
+    #[test]
+    fn test_normalize_domain_list_all_empty_items() {
+        let input = Some(vec!["".to_string(), ".".to_string(), "..".to_string()]);
+        assert_eq!(normalize_domain_list(input), None);
+    }
+
+    // ========== domain_matches_suffix ==========
+
+    #[test]
+    fn test_domain_matches_suffix_exact() {
+        assert!(domain_matches_suffix("google.com", "google.com"));
+    }
+
+    #[test]
+    fn test_domain_matches_suffix_case_insensitive() {
+        assert!(domain_matches_suffix("Google.Com", "google.com"));
+    }
+
+    #[test]
+    fn test_domain_matches_suffix_single_subdomain() {
+        assert!(domain_matches_suffix("www.google.com", "google.com"));
+    }
+
+    #[test]
+    fn test_domain_matches_suffix_deep_subdomain() {
+        assert!(domain_matches_suffix("a.b.c.google.com", "google.com"));
+    }
+
+    #[test]
+    fn test_domain_matches_suffix_not_a_subdomain_1() {
+        assert!(!domain_matches_suffix("notgoogle.com", "google.com"));
+    }
+
+    #[test]
+    fn test_domain_matches_suffix_not_a_subdomain_2() {
+        assert!(!domain_matches_suffix("fakegoogle.com", "google.com"));
+    }
+
+    #[test]
+    fn test_domain_matches_suffix_longer_tld() {
+        assert!(!domain_matches_suffix("google.com.cn", "google.com"));
+    }
+
+    #[test]
+    fn test_domain_matches_suffix_shorter_domain() {
+        assert!(!domain_matches_suffix("com", "google.com"));
+    }
+
+    #[test]
+    fn test_domain_matches_suffix_trailing_dot_domain() {
+        assert!(domain_matches_suffix("google.com.", "google.com"));
+    }
+
+    #[test]
+    fn test_domain_matches_suffix_trailing_dot_suffix() {
+        assert!(domain_matches_suffix("google.com", "google.com."));
+    }
+
+    #[test]
+    fn test_domain_matches_suffix_both_trailing_dots() {
+        assert!(domain_matches_suffix("www.google.com.", "google.com."));
+    }
+
+    #[test]
+    fn test_domain_matches_suffix_empty_domain() {
+        assert!(!domain_matches_suffix("", "google.com"));
+    }
+
+    #[test]
+    fn test_domain_matches_suffix_empty_suffix() {
+        assert!(!domain_matches_suffix("google.com", ""));
+    }
+
+    #[test]
+    fn test_domain_matches_suffix_both_empty() {
+        // 与当前实现保持一致：空字符串视为相等
+        assert!(domain_matches_suffix("", ""));
+    }
+
+    // ========== is_forced ==========
+
+    #[test]
+    fn test_is_forced_none_list() {
+        assert!(!is_forced("google.com", &None));
+    }
+
+    #[test]
+    fn test_is_forced_exact_match() {
+        let list = Some(vec!["google.com".to_string()]);
+        assert!(is_forced("google.com", &list));
+    }
+
+    #[test]
+    fn test_is_forced_subdomain_match() {
+        let list = Some(vec!["google.com".to_string()]);
+        assert!(is_forced("www.google.com", &list));
+    }
+
+    #[test]
+    fn test_is_forced_multi_rule_hit_one() {
+        let list = Some(vec!["google.com".to_string(), "github.com".to_string()]);
+        assert!(is_forced("api.github.com", &list));
+    }
+
+    #[test]
+    fn test_is_forced_no_match() {
+        let list = Some(vec!["google.com".to_string(), "github.com".to_string()]);
+        assert!(!is_forced("example.org", &list));
+    }
+
+    #[test]
+    fn test_is_forced_case_insensitive() {
+        let list = Some(vec!["Google.COM".to_string()]);
+        assert!(is_forced("www.google.com", &list));
+    }
 }
 
 /// 检查域名是否匹配强制列表中的任一条目。

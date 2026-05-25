@@ -8,6 +8,7 @@ pub struct PollutionChecker {
     pub max_packets: usize,
 }
 
+#[derive(Debug, PartialEq)]
 pub enum PollutionResult {
     Clean,
     Polluted,
@@ -237,4 +238,357 @@ pub fn extract_answer_ips(resp: &[u8]) -> Result<Vec<IpAddr>> {
     }
 
     Ok(ips)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
+    use hickory_proto::rr::rdata::{A as ARecord, AAAA as AAAARecord};
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use std::collections::HashSet;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // ========== helpers: 用 hickory 构造 A/AAAA/空答案包 ==========
+
+    fn a_packet(ip: Ipv4Addr) -> Vec<u8> {
+        let mut msg = Message::new();
+        msg.set_id(1234);
+        msg.set_message_type(MessageType::Response);
+        msg.set_response_code(ResponseCode::NoError);
+        let name = Name::from_ascii("example.com").unwrap();
+        msg.add_query(Query::query(name.clone(), RecordType::A));
+
+        let mut answer = Record::new();
+        answer.set_name(name);
+        answer.set_record_type(RecordType::A);
+        answer.set_ttl(300);
+        answer.set_data(Some(RData::A(ARecord(ip))));
+        msg.add_answer(answer);
+
+        msg.to_vec().unwrap()
+    }
+
+    fn aaaa_packet(ip: Ipv6Addr) -> Vec<u8> {
+        let mut msg = Message::new();
+        msg.set_id(1234);
+        msg.set_message_type(MessageType::Response);
+        msg.set_response_code(ResponseCode::NoError);
+        let name = Name::from_ascii("example.com").unwrap();
+        msg.add_query(Query::query(name.clone(), RecordType::AAAA));
+
+        let mut answer = Record::new();
+        answer.set_name(name);
+        answer.set_record_type(RecordType::AAAA);
+        answer.set_ttl(300);
+        answer.set_data(Some(RData::AAAA(AAAARecord(ip))));
+        msg.add_answer(answer);
+
+        msg.to_vec().unwrap()
+    }
+
+    fn empty_answers_packet() -> Vec<u8> {
+        let mut msg = Message::new();
+        msg.set_id(1234);
+        msg.set_message_type(MessageType::Response);
+        msg.set_response_code(ResponseCode::NoError);
+        let name = Name::from_ascii("example.com").unwrap();
+        msg.add_query(Query::query(name, RecordType::A));
+        msg.to_vec().unwrap()
+    }
+
+    // ========== helper: 手写 HTTPS/SVCB 响应字节数组 ==========
+    // hickory 序列化时拒绝 RecordType::HTTPS + RData::SVCB，故直接手写 wire format
+
+    fn https_raw_packet(v4s: &[Ipv4Addr], v6s: &[Ipv6Addr]) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // DNS Header (12 bytes)
+        buf.extend_from_slice(&[
+            0x12, 0x34, // ID
+            0x81, 0x80, // Flags: Response, NoError
+            0x00, 0x01, // QDCOUNT
+            0x00, 0x01, // ANCOUNT
+            0x00, 0x00, // NSCOUNT
+            0x00, 0x00, // ARCOUNT
+        ]);
+
+        // Question: example.com
+        buf.push(7);
+        buf.extend_from_slice(b"example");
+        buf.push(3);
+        buf.extend_from_slice(b"com");
+        buf.push(0);
+        buf.extend_from_slice(&[0x00, 65, 0x00, 0x01]); // Type HTTPS(65), Class IN
+
+        // Answer
+        // Name: pointer to question name at offset 12 (0x0C)
+        buf.extend_from_slice(&[0xC0, 0x0C]);
+        buf.extend_from_slice(&[0x00, 65, 0x00, 0x01]); // Type HTTPS, Class IN
+        buf.extend_from_slice(&[0x00, 0x00, 0x01, 0x2C]); // TTL 300
+
+        // RData: SVCB
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&[0x00, 0x01]); // SvcPriority 1
+        rdata.push(0); // TargetName root (0x00)
+
+        for ip in v4s {
+            rdata.extend_from_slice(&[0x00, 0x04]); // key = ipv4hint
+            rdata.extend_from_slice(&[0x00, 0x04]); // len = 4
+            rdata.extend_from_slice(&ip.octets());
+        }
+
+        for ip in v6s {
+            rdata.extend_from_slice(&[0x00, 0x06]); // key = ipv6hint
+            rdata.extend_from_slice(&[0x00, 0x10]); // len = 16
+            rdata.extend_from_slice(&ip.octets());
+        }
+
+        let rdlen = rdata.len() as u16;
+        buf.extend_from_slice(&rdlen.to_be_bytes());
+        buf.extend_from_slice(&rdata);
+
+        buf
+    }
+
+    // ========== is_gfw_ipv6 ==========
+
+    #[test]
+    fn test_is_gfw_ipv6_hit() {
+        let ip = Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 1); // 2001::1
+        assert!(is_gfw_ipv6(&ip));
+    }
+
+    #[test]
+    fn test_is_gfw_ipv6_miss() {
+        let ip = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+        assert!(!is_gfw_ipv6(&ip));
+    }
+
+    // ========== extract_answer_ips 正常路径 ==========
+
+    #[test]
+    fn test_extract_a_record() {
+        let ip = Ipv4Addr::new(1, 2, 3, 4);
+        let bytes = a_packet(ip);
+        let result = extract_answer_ips(&bytes).unwrap();
+        assert_eq!(result, vec![IpAddr::V4(ip)]);
+    }
+
+    #[test]
+    fn test_extract_aaaa_record() {
+        let ip = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+        let bytes = aaaa_packet(ip);
+        let result = extract_answer_ips(&bytes).unwrap();
+        assert_eq!(result, vec![IpAddr::V6(ip)]);
+    }
+
+    #[test]
+    fn test_extract_multiple_a_records() {
+        let mut msg = Message::new();
+        msg.set_id(1234);
+        msg.set_message_type(MessageType::Response);
+        msg.set_response_code(ResponseCode::NoError);
+        let name = Name::from_ascii("example.com").unwrap();
+        msg.add_query(Query::query(name.clone(), RecordType::A));
+
+        for ip in [Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8)] {
+            let mut answer = Record::new();
+            answer.set_name(name.clone());
+            answer.set_record_type(RecordType::A);
+            answer.set_ttl(300);
+            answer.set_data(Some(RData::A(ARecord(ip))));
+            msg.add_answer(answer);
+        }
+
+        let bytes = msg.to_vec().unwrap();
+        let result = extract_answer_ips(&bytes).unwrap();
+        assert_eq!(
+            result,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+                IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_extract_https_ipv4hint() {
+        let ip = Ipv4Addr::new(1, 2, 3, 4);
+        let bytes = https_raw_packet(&[ip], &[]);
+        let result = extract_answer_ips(&bytes).unwrap();
+        assert_eq!(result, vec![IpAddr::V4(ip)]);
+    }
+
+    #[test]
+    fn test_extract_https_ipv6hint() {
+        let ip = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+        let bytes = https_raw_packet(&[], &[ip]);
+        let result = extract_answer_ips(&bytes).unwrap();
+        assert_eq!(result, vec![IpAddr::V6(ip)]);
+    }
+
+    #[test]
+    fn test_extract_https_both_hints() {
+        let v4 = Ipv4Addr::new(1, 2, 3, 4);
+        let v6 = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+        let bytes = https_raw_packet(&[v4], &[v6]);
+        let result = extract_answer_ips(&bytes).unwrap();
+        assert_eq!(result, vec![IpAddr::V4(v4), IpAddr::V6(v6)]);
+    }
+
+    #[test]
+    fn test_extract_empty_answers() {
+        let bytes = empty_answers_packet();
+        let result = extract_answer_ips(&bytes).unwrap();
+        assert!(result.is_empty());
+    }
+
+    // ========== extract_answer_ips 异常路径 ==========
+
+    #[test]
+    fn test_extract_header_too_short() {
+        let result = extract_answer_ips(&[0u8; 10]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_invalid_question() {
+        let mut buf = vec![0u8; 12];
+        buf[4] = 0;
+        buf[5] = 1; // qdcount = 1, but no question data
+        let result = extract_answer_ips(&buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_invalid_answer() {
+        let mut msg = Message::new();
+        msg.set_id(1234);
+        msg.set_message_type(MessageType::Response);
+        msg.set_response_code(ResponseCode::NoError);
+        let name = Name::from_ascii("example.com").unwrap();
+        msg.add_query(Query::query(name.clone(), RecordType::A));
+        let mut buf = msg.to_vec().unwrap();
+        buf[6] = 0;
+        buf[7] = 1; // ancount = 1, but no actual answer
+        let result = extract_answer_ips(&buf);
+        assert!(result.is_err());
+    }
+
+    // ========== PollutionChecker::check ==========
+
+    #[test]
+    fn test_checker_polluted_ipv4() {
+        let v4 = HashSet::from([Ipv4Addr::new(1, 2, 3, 4)]);
+        let checker = PollutionChecker {
+            v4,
+            v6: HashSet::new(),
+            max_packets: 5,
+        };
+        let resp = a_packet(Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(checker.check(&resp), PollutionResult::Polluted);
+    }
+
+    #[test]
+    fn test_checker_polluted_ipv6_list() {
+        let ip = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+        let v6 = HashSet::from([ip]);
+        let checker = PollutionChecker {
+            v4: HashSet::new(),
+            v6,
+            max_packets: 5,
+        };
+        let resp = aaaa_packet(ip);
+        assert_eq!(checker.check(&resp), PollutionResult::Polluted);
+    }
+
+    #[test]
+    fn test_checker_polluted_ipv6_gfw() {
+        let ip = Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 1); // GFW 特征地址
+        let checker = PollutionChecker {
+            v4: HashSet::new(),
+            v6: HashSet::new(),
+            max_packets: 5,
+        };
+        let resp = aaaa_packet(ip);
+        assert_eq!(checker.check(&resp), PollutionResult::Polluted);
+    }
+
+    #[test]
+    fn test_checker_clean() {
+        let checker = PollutionChecker {
+            v4: HashSet::from([Ipv4Addr::new(9, 9, 9, 9)]),
+            v6: HashSet::new(),
+            max_packets: 5,
+        };
+        let resp = a_packet(Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(checker.check(&resp), PollutionResult::Clean);
+    }
+
+    #[test]
+    fn test_checker_invalid_packet() {
+        let checker = PollutionChecker {
+            v4: HashSet::new(),
+            v6: HashSet::new(),
+            max_packets: 5,
+        };
+        assert_eq!(checker.check(&[0u8; 10]), PollutionResult::Invalid);
+    }
+
+    // ========== is_ipv4_polluted / is_ipv6_polluted ==========
+
+    #[test]
+    fn test_is_ipv4_polluted_hit() {
+        let v4 = HashSet::from([Ipv4Addr::new(1, 2, 3, 4)]);
+        let checker = PollutionChecker {
+            v4,
+            v6: HashSet::new(),
+            max_packets: 5,
+        };
+        assert!(checker.is_ipv4_polluted(&Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn test_is_ipv4_polluted_miss() {
+        let checker = PollutionChecker {
+            v4: HashSet::new(),
+            v6: HashSet::new(),
+            max_packets: 5,
+        };
+        assert!(!checker.is_ipv4_polluted(&Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn test_is_ipv6_polluted_list_hit() {
+        let ip = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+        let checker = PollutionChecker {
+            v4: HashSet::new(),
+            v6: HashSet::from([ip]),
+            max_packets: 5,
+        };
+        assert!(checker.is_ipv6_polluted(&ip));
+    }
+
+    #[test]
+    fn test_is_ipv6_polluted_gfw_hit() {
+        let ip = Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 1);
+        let checker = PollutionChecker {
+            v4: HashSet::new(),
+            v6: HashSet::new(),
+            max_packets: 5,
+        };
+        assert!(checker.is_ipv6_polluted(&ip));
+    }
+
+    #[test]
+    fn test_is_ipv6_polluted_miss() {
+        let ip = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+        let checker = PollutionChecker {
+            v4: HashSet::new(),
+            v6: HashSet::new(),
+            max_packets: 5,
+        };
+        assert!(!checker.is_ipv6_polluted(&ip));
+    }
 }

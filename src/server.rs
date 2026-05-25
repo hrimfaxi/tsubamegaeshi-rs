@@ -1087,3 +1087,108 @@ pub fn parse_upstream(s: &str, field_name: &str) -> anyhow::Result<SocketAddr> {
         .or_else(|_| s.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))
         .with_context(|| format!("Invalid {}: {}", field_name, s))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    // ========== parse_hosts ==========
+
+    #[test]
+    fn test_parse_hosts_ipv4() {
+        let mut map = HashMap::new();
+        map.insert("Example.COM".to_string(), "1.2.3.4".to_string());
+        let result = parse_hosts::<Ipv4Addr>(&map);
+        assert_eq!(result.get("example.com"), Some(&Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn test_parse_hosts_ipv6() {
+        let mut map = HashMap::new();
+        map.insert("Example.COM".to_string(), "::1".to_string());
+        let result = parse_hosts::<Ipv6Addr>(&map);
+        assert_eq!(
+            result.get("example.com"),
+            Some(&Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn test_parse_hosts_key_normalization() {
+        let mut map = HashMap::new();
+        map.insert(".Test.ORG.".to_string(), "1.2.3.4".to_string());
+        let result = parse_hosts::<Ipv4Addr>(&map);
+        assert!(result.contains_key("test.org"));
+        assert!(!result.contains_key(".Test.ORG."));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid IP for bad.example.com")]
+    fn test_parse_hosts_invalid_ip_panics() {
+        let mut map = HashMap::new();
+        map.insert("bad.example.com".to_string(), "not-an-ip".to_string());
+        let _: HashMap<String, Ipv4Addr> = parse_hosts(&map);
+    }
+
+    // ========== parse_upstream ==========
+
+    #[test]
+    fn test_parse_upstream_ipv4_with_port() {
+        let result = parse_upstream("8.8.8.8:53", "test").unwrap();
+        assert_eq!(
+            result,
+            SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 53)
+        );
+    }
+
+    #[test]
+    fn test_parse_upstream_ipv4_without_port() {
+        let result = parse_upstream("8.8.8.8", "test").unwrap();
+        assert_eq!(
+            result,
+            SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 53)
+        );
+    }
+
+    #[test]
+    fn test_parse_upstream_ipv6_with_port() {
+        let result = parse_upstream("[2001:4860:4860::8888]:53", "test").unwrap();
+        assert_eq!(
+            result,
+            SocketAddr::new(
+                Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888).into(),
+                53
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_upstream_ipv6_without_port() {
+        let result = parse_upstream("2001:4860:4860::8888", "test").unwrap();
+        assert_eq!(
+            result,
+            SocketAddr::new(
+                Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888).into(),
+                53
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_upstream_invalid() {
+        let result = parse_upstream("not-a-host", "test");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_upstream_invalid_ipv6_no_brackets_with_port() {
+        // "2001::1:53" 会被解析为 IPv6 + 端口 53，但 IPv6 里含 :53 是合法的地址部分
+        // 实际上 "2001::1:53" 作为 SocketAddr::from_str 会成功（IPv6 地址 2001::1:53）
+        // 但 parse_upstream 会先尝试 s.parse::<SocketAddr>()，这能解析
+        // 所以这里测一个明确非法的
+        let result = parse_upstream(":::53", "test");
+        assert!(result.is_err());
+    }
+}

@@ -287,3 +287,101 @@ where
     }
     set
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn temp_ip_file(content: &str) -> (std::path::PathBuf, String) {
+        let path = std::env::temp_dir().join(format!(
+            "tsubame_ipset_test_{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, content).unwrap();
+        let path_str = path.to_str().unwrap().to_string();
+        (path, path_str)
+    }
+
+    // ========== load_ip_set ==========
+
+    #[test]
+    fn test_load_ip_set_normal() {
+        let (path, path_str) = temp_ip_file("1.2.3.4\n5.6.7.8\n");
+        let set = load_ip_set(&path_str, |s| s.parse::<Ipv4Addr>().ok());
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&Ipv4Addr::new(1, 2, 3, 4)));
+        assert!(set.contains(&Ipv4Addr::new(5, 6, 7, 8)));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_load_ip_set_skip_empty_lines() {
+        let (path, path_str) = temp_ip_file("\n\n1.2.3.4\n\n");
+        let set = load_ip_set(&path_str, |s| s.parse::<Ipv4Addr>().ok());
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&Ipv4Addr::new(1, 2, 3, 4)));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_load_ip_set_skip_full_line_comment() {
+        let (path, path_str) = temp_ip_file("# comment\n1.2.3.4\n# another");
+        let set = load_ip_set(&path_str, |s| s.parse::<Ipv4Addr>().ok());
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&Ipv4Addr::new(1, 2, 3, 4)));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_load_ip_set_trailing_comment() {
+        let (path, path_str) = temp_ip_file("1.2.3.4 # comment\n5.6.7.8\t# tab comment");
+        let set = load_ip_set(&path_str, |s| s.parse::<Ipv4Addr>().ok());
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&Ipv4Addr::new(1, 2, 3, 4)));
+        assert!(set.contains(&Ipv4Addr::new(5, 6, 7, 8)));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_load_ip_set_first_token_only() {
+        let (path, path_str) = temp_ip_file("1.2.3.4 extra garbage\n5.6.7.8");
+        let set = load_ip_set(&path_str, |s| s.parse::<Ipv4Addr>().ok());
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&Ipv4Addr::new(1, 2, 3, 4)));
+        assert!(set.contains(&Ipv4Addr::new(5, 6, 7, 8)));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_load_ip_set_skip_invalid_ip() {
+        let (path, path_str) = temp_ip_file("1.2.3.4\nnot-an-ip\n5.6.7.8\n");
+        let set = load_ip_set(&path_str, |s| s.parse::<Ipv4Addr>().ok());
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&Ipv4Addr::new(1, 2, 3, 4)));
+        assert!(set.contains(&Ipv4Addr::new(5, 6, 7, 8)));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_load_ip_set_file_not_found() {
+        let set = load_ip_set("/nonexistent/path/ipset.txt", |s| {
+            s.parse::<Ipv4Addr>().ok()
+        });
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn test_load_ip_set_ipv6() {
+        let (path, path_str) = temp_ip_file("::1\n2001:4860::8888\n");
+        let set = load_ip_set(&path_str, |s| s.parse::<Ipv6Addr>().ok());
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)));
+        assert!(set.contains(&Ipv6Addr::new(0x2001, 0x4860, 0, 0, 0, 0, 0, 0x8888)));
+        fs::remove_file(path).unwrap();
+    }
+}

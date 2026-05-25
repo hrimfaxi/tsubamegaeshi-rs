@@ -114,3 +114,146 @@ impl Config {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// 构造一个“基础合法”的 Config，各测试在此基础上只改要测的字段
+    fn valid_config() -> Config {
+        Config {
+            listen: "0.0.0.0:53".to_string(),
+            special_suffixes: vec![],
+            special_upstream: "127.0.0.1:53".to_string(),
+            domestic_upstream: "127.0.0.1:53".to_string(),
+            foreign_upstream: "127.0.0.1:53".to_string(),
+            mmdb_path: "/dev/null".to_string(),
+            cache_size: 100,
+            query_timeout_sec: 5,
+            enable_ipv6_aaaa: true,
+            log_level: None,
+            gfwlist_path: None,
+            gfbloom_fp_rate: None,
+            force_foreign_domains: None,
+            force_domestic_domains: None,
+            hosts: None,
+            marksite: None,
+            adblock_path: None,
+            adblock_fp_rate: None,
+            domestic_countries: default_domestic_countries(),
+            ipv4_list: default_ipv4_list_path(),
+            ipv6_list: default_ipv6_list_path(),
+            max_polluted_packets: default_max_polluted_packets(),
+        }
+    }
+
+    // ========== query_timeout_sec ==========
+
+    #[test]
+    fn test_validate_query_timeout_zero() {
+        let mut cfg = valid_config();
+        cfg.query_timeout_sec = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    // ========== gfbloom_fp_rate ==========
+
+    #[test]
+    fn test_validate_gfbloom_fp_rate_valid() {
+        let mut cfg = valid_config();
+        cfg.gfbloom_fp_rate = Some(0.001);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_gfbloom_fp_rate_zero() {
+        let mut cfg = valid_config();
+        cfg.gfbloom_fp_rate = Some(0.0);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_gfbloom_fp_rate_one() {
+        let mut cfg = valid_config();
+        cfg.gfbloom_fp_rate = Some(1.0);
+        assert!(cfg.validate().is_err());
+    }
+
+    // ========== adblock_fp_rate ==========
+
+    #[test]
+    fn test_validate_adblock_fp_rate_valid() {
+        let mut cfg = valid_config();
+        cfg.adblock_fp_rate = Some(0.001);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_adblock_fp_rate_zero() {
+        let mut cfg = valid_config();
+        cfg.adblock_fp_rate = Some(0.0);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_adblock_fp_rate_one() {
+        let mut cfg = valid_config();
+        cfg.adblock_fp_rate = Some(1.0);
+        assert!(cfg.validate().is_err());
+    }
+
+    // ========== marksite table suffix ==========
+
+    #[test]
+    fn test_validate_marksite_empty_key() {
+        let mut cfg = valid_config();
+        let mut map = HashMap::new();
+        map.insert("".to_string(), vec!["example.com".to_string()]);
+        cfg.marksite = Some(map);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_marksite_invalid_char_space() {
+        let mut cfg = valid_config();
+        let mut map = HashMap::new();
+        map.insert("bad table".to_string(), vec!["example.com".to_string()]);
+        cfg.marksite = Some(map);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_marksite_invalid_char_special() {
+        let mut cfg = valid_config();
+        let mut map = HashMap::new();
+        map.insert("table@123".to_string(), vec!["example.com".to_string()]);
+        cfg.marksite = Some(map);
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_marksite_valid_chars() {
+        let mut cfg = valid_config();
+        let mut map = HashMap::new();
+        map.insert("table_123-abc".to_string(), vec!["example.com".to_string()]);
+        cfg.marksite = Some(map);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_marksite_valid_alphanumeric() {
+        let mut cfg = valid_config();
+        let mut map = HashMap::new();
+        map.insert("abc123".to_string(), vec!["example.com".to_string()]);
+        cfg.marksite = Some(map);
+        assert!(cfg.validate().is_ok());
+    }
+
+    // ========== 合法基线 ==========
+
+    #[test]
+    fn test_validate_baseline_ok() {
+        assert!(valid_config().validate().is_ok());
+    }
+}

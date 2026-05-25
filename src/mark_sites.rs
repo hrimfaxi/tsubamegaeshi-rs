@@ -109,3 +109,98 @@ impl MarkSites {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_mark_sites(rules: Vec<(&str, Vec<&str>)>) -> MarkSites {
+        let groups = rules
+            .into_iter()
+            .map(|(table, patterns)| MarkGroup {
+                nft_table: format!("{}{}", NFT_TABLE_PREFIX, table),
+                rules: patterns
+                    .into_iter()
+                    .map(|p| MarkRule {
+                        pattern: canonical_domain(p),
+                    })
+                    .collect(),
+            })
+            .collect();
+        MarkSites { groups }
+    }
+
+    #[test]
+    fn test_match_single_group() {
+        let ms = make_mark_sites(vec![("ads", vec!["google.com"])]);
+        let matched: Vec<&str> = ms
+            .match_groups("www.google.com")
+            .map(|g| g.nft_table.as_str())
+            .collect();
+        assert_eq!(matched, vec!["tsubamegaeshi_ads"]);
+    }
+
+    #[test]
+    fn test_match_multiple_groups() {
+        let ms = make_mark_sites(vec![
+            ("ads", vec!["google.com"]),
+            ("video", vec!["youtube"]),
+        ]);
+        // 这个域名同时包含 "google.com" 和 "youtube" 两个子串
+        let matched: Vec<&str> = ms
+            .match_groups("youtube.google.com")
+            .map(|g| g.nft_table.as_str())
+            .collect();
+        assert_eq!(matched, vec!["tsubamegaeshi_ads", "tsubamegaeshi_video"]);
+    }
+
+    #[test]
+    fn test_match_no_hit() {
+        let ms = make_mark_sites(vec![("ads", vec!["google.com"])]);
+        let matched: Vec<&str> = ms
+            .match_groups("example.org")
+            .map(|g| g.nft_table.as_str())
+            .collect();
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn test_match_case_insensitive() {
+        let ms = make_mark_sites(vec![("ads", vec!["GOOGLE.COM"])]);
+        let matched: Vec<&str> = ms
+            .match_groups("WWW.google.COM")
+            .map(|g| g.nft_table.as_str())
+            .collect();
+        assert_eq!(matched, vec!["tsubamegaeshi_ads"]);
+    }
+
+    #[test]
+    fn test_match_substring_behavior() {
+        let ms = make_mark_sites(vec![("track", vec!["google"])]);
+        let matched: Vec<&str> = ms
+            .match_groups("notgoogle.com")
+            .map(|g| g.nft_table.as_str())
+            .collect();
+        assert_eq!(matched, vec!["tsubamegaeshi_track"]);
+    }
+
+    #[test]
+    fn test_match_empty_rules_no_hit() {
+        let ms = make_mark_sites(vec![("empty", vec![])]);
+        let matched: Vec<&str> = ms
+            .match_groups("anything.com")
+            .map(|g| g.nft_table.as_str())
+            .collect();
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn test_match_multiple_rules_in_one_group() {
+        let ms = make_mark_sites(vec![("mixed", vec!["google.com", "github.com"])]);
+        let matched: Vec<&str> = ms
+            .match_groups("api.github.com")
+            .map(|g| g.nft_table.as_str())
+            .collect();
+        assert_eq!(matched, vec!["tsubamegaeshi_mixed"]);
+    }
+}

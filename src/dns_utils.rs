@@ -236,3 +236,169 @@ pub fn print_first_ip(resp: &[u8], tag: &str, domain: &str, upstream: &str) {
         tag, domain, upstream
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::op::{Message, Query, ResponseCode};
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn sample_query() -> Message {
+        let mut msg = Message::new();
+        msg.set_id(1234);
+        msg.set_recursion_desired(true);
+        let name = Name::from_ascii("example.com").unwrap();
+        msg.add_query(Query::query(name, RecordType::A));
+        msg
+    }
+
+    // ========== build_a_response ==========
+
+    #[test]
+    fn test_build_a_response() {
+        let query = sample_query();
+        let ip = Ipv4Addr::new(1, 2, 3, 4);
+        let bytes = build_a_response(&query, ip, 60);
+
+        let resp = Message::from_vec(&bytes).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert_eq!(resp.answers().len(), 1);
+
+        let ans = &resp.answers()[0];
+        assert_eq!(ans.record_type(), RecordType::A);
+        assert_eq!(ans.ttl(), 60);
+        assert_eq!(
+            ans.data().unwrap().ip_addr(),
+            Some(std::net::IpAddr::V4(ip))
+        );
+    }
+
+    // ========== build_aaaa_response ==========
+
+    #[test]
+    fn test_build_aaaa_response() {
+        let query = sample_query();
+        let ip = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+        let bytes = build_aaaa_response(&query, ip, 300);
+
+        let resp = Message::from_vec(&bytes).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert_eq!(resp.answers().len(), 1);
+
+        let ans = &resp.answers()[0];
+        assert_eq!(ans.record_type(), RecordType::AAAA);
+        assert_eq!(ans.ttl(), 300);
+    }
+
+    // ========== build_nodata_response ==========
+
+    #[test]
+    fn test_build_nodata_response() {
+        let query = sample_query();
+        let bytes = build_nodata_response(&query);
+
+        let resp = Message::from_vec(&bytes).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert!(resp.answers().is_empty());
+    }
+
+    // ========== build_servfail_response ==========
+
+    #[test]
+    fn test_build_servfail_response() {
+        let query = sample_query();
+        let bytes = build_servfail_response(&query);
+
+        let resp = Message::from_vec(&bytes).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::ServFail);
+    }
+
+    // ========== build_https_response 暂不直接测 ==========
+    // 原因：hickory 对 RecordType::HTTPS + RData::SVCB 的序列化有严格类型检查，
+    // 与 pollution.rs 中遇到的 to_vec() panic 相同。
+    // 构造端行为已通过 pollution.rs 的 extract_answer_ips 间接覆盖。
+
+    // ========== response_cache_ttl ==========
+
+    #[test]
+    fn test_response_cache_ttl_single() {
+        let mut msg = Message::new();
+        msg.set_response_code(ResponseCode::NoError);
+        let name = Name::from_ascii("example.com").unwrap();
+
+        let mut answer = Record::new();
+        answer.set_name(name);
+        answer.set_record_type(RecordType::A);
+        answer.set_ttl(60);
+        answer.set_data(Some(RData::A(ARecord(Ipv4Addr::new(1, 2, 3, 4)))));
+        msg.add_answer(answer);
+
+        assert_eq!(response_cache_ttl(&msg), Some(60));
+    }
+
+    #[test]
+    fn test_response_cache_ttl_multiple_min() {
+        let mut msg = Message::new();
+        msg.set_response_code(ResponseCode::NoError);
+        let name = Name::from_ascii("example.com").unwrap();
+
+        for ttl in [120u32, 60, 300] {
+            let mut answer = Record::new();
+            answer.set_name(name.clone());
+            answer.set_record_type(RecordType::A);
+            answer.set_ttl(ttl);
+            answer.set_data(Some(RData::A(ARecord(Ipv4Addr::new(1, 2, 3, 4)))));
+            msg.add_answer(answer);
+        }
+
+        assert_eq!(response_cache_ttl(&msg), Some(60));
+    }
+
+    #[test]
+    fn test_response_cache_ttl_zero() {
+        let mut msg = Message::new();
+        msg.set_response_code(ResponseCode::NoError);
+        let name = Name::from_ascii("example.com").unwrap();
+
+        let mut answer = Record::new();
+        answer.set_name(name);
+        answer.set_record_type(RecordType::A);
+        answer.set_ttl(0);
+        answer.set_data(Some(RData::A(ARecord(Ipv4Addr::new(1, 2, 3, 4)))));
+        msg.add_answer(answer);
+
+        assert_eq!(response_cache_ttl(&msg), None);
+    }
+
+    #[test]
+    fn test_response_cache_ttl_no_answers() {
+        let msg = Message::new();
+        assert_eq!(response_cache_ttl(&msg), None);
+    }
+
+    // ========== rewrite_dns_id ==========
+
+    #[test]
+    fn test_rewrite_dns_id_normal() {
+        let mut buf = vec![0xAB, 0xCD, 0xEF];
+        rewrite_dns_id(&mut buf, 0x1234);
+        assert_eq!(buf[0], 0x12);
+        assert_eq!(buf[1], 0x34);
+        assert_eq!(buf[2], 0xEF);
+    }
+
+    #[test]
+    fn test_rewrite_dns_id_short_buffer() {
+        let mut buf = vec![0xAB];
+        rewrite_dns_id(&mut buf, 0x1234);
+        assert_eq!(buf, vec![0xAB]);
+    }
+
+    #[test]
+    fn test_rewrite_dns_id_empty() {
+        let mut buf: Vec<u8> = vec![];
+        rewrite_dns_id(&mut buf, 0x1234);
+        assert!(buf.is_empty());
+    }
+}

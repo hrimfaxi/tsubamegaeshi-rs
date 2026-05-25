@@ -108,3 +108,159 @@ impl BloomDomainChecker {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use std::fs;
+
+    fn temp_gfwlist_file(plaintext: &str) -> (std::path::PathBuf, String) {
+        let encoded = STANDARD.encode(plaintext);
+        let path = std::env::temp_dir().join(format!(
+            "tsubame_gfwlist_test_{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, encoded).unwrap();
+        let path_str = path.to_str().unwrap().to_string();
+        (path, path_str)
+    }
+
+    // ========== GfwlistDecoder::extract_domains 正常路径 ==========
+
+    #[test]
+    fn test_extract_pipe_domain() {
+        let (path, path_str) = temp_gfwlist_file("||google.com\n");
+        let decoder = GfwlistDecoder::new(&path_str);
+        let domains = decoder.extract_domains().unwrap();
+        assert!(domains.contains(&"google.com".to_string()));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_extract_with_caret() {
+        let (path, path_str) = temp_gfwlist_file("||youtube.com^\n");
+        let decoder = GfwlistDecoder::new(&path_str);
+        let domains = decoder.extract_domains().unwrap();
+        assert!(domains.contains(&"youtube.com".to_string()));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_extract_with_path() {
+        let (path, path_str) = temp_gfwlist_file("||github.com/path\n");
+        let decoder = GfwlistDecoder::new(&path_str);
+        let domains = decoder.extract_domains().unwrap();
+        assert!(domains.contains(&"github.com".to_string()));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_extract_skips_comment() {
+        let (path, path_str) = temp_gfwlist_file("! comment\n||google.com\n");
+        let decoder = GfwlistDecoder::new(&path_str);
+        let domains = decoder.extract_domains().unwrap();
+        assert!(!domains.contains(&"comment".to_string()));
+        assert!(domains.contains(&"google.com".to_string()));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_extract_skips_whitelist() {
+        let (path, path_str) = temp_gfwlist_file("@@||white.example.com\n||google.com\n");
+        let decoder = GfwlistDecoder::new(&path_str);
+        let domains = decoder.extract_domains().unwrap();
+        assert!(!domains.contains(&"white.example.com".to_string()));
+        assert!(domains.contains(&"google.com".to_string()));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_extract_skips_non_pipe() {
+        let (path, path_str) = temp_gfwlist_file("|http://not-supported.com\n||google.com\n");
+        let decoder = GfwlistDecoder::new(&path_str);
+        let domains = decoder.extract_domains().unwrap();
+        assert!(!domains.contains(&"not-supported.com".to_string()));
+        assert!(domains.contains(&"google.com".to_string()));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_extract_dedup_and_normalize() {
+        let (path, path_str) = temp_gfwlist_file("||Google.COM\n||google.com\n||Google.COM\n");
+        let decoder = GfwlistDecoder::new(&path_str);
+        let domains = decoder.extract_domains().unwrap();
+        assert_eq!(domains.len(), 1);
+        assert!(domains.contains(&"google.com".to_string()));
+        fs::remove_file(path).unwrap();
+    }
+
+    // ========== Base64 / UTF-8 异常路径 ==========
+
+    #[test]
+    fn test_extract_empty_file() {
+        let path = std::env::temp_dir().join("tsubame_gfwlist_empty.txt");
+        fs::write(&path, "").unwrap();
+        let decoder = GfwlistDecoder::new(path.to_str().unwrap());
+        assert!(decoder.extract_domains().is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_extract_invalid_base64() {
+        let path = std::env::temp_dir().join("tsubame_gfwlist_bad64.txt");
+        fs::write(&path, "%%%not-base64%%%").unwrap();
+        let decoder = GfwlistDecoder::new(path.to_str().unwrap());
+        assert!(decoder.extract_domains().is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_extract_non_utf8() {
+        let bytes = vec![0x80u8, 0x81, 0x82];
+        let encoded = STANDARD.encode(&bytes);
+        let path = std::env::temp_dir().join("tsubame_gfwlist_nonutf8.txt");
+        fs::write(&path, encoded).unwrap();
+        let decoder = GfwlistDecoder::new(path.to_str().unwrap());
+        assert!(decoder.extract_domains().is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    // ========== BloomDomainChecker::new ==========
+
+    #[test]
+    fn test_bloom_new_empty() {
+        let result = BloomDomainChecker::new(&[], 0.001);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bloom_new_ok() {
+        let result = BloomDomainChecker::new(&["google.com".to_string()], 0.001);
+        assert!(result.is_ok());
+    }
+
+    // ========== BloomDomainChecker::check — 只测命中，不测 miss ==========
+
+    #[test]
+    fn test_bloom_exact_hit() {
+        let checker = BloomDomainChecker::new(&["google.com".to_string()], 0.001).unwrap();
+        assert!(checker.check("google.com"));
+    }
+
+    #[test]
+    fn test_bloom_subdomain_hit() {
+        let checker = BloomDomainChecker::new(&["google.com".to_string()], 0.001).unwrap();
+        assert!(checker.check("www.google.com"));
+    }
+
+    #[test]
+    fn test_bloom_deep_subdomain_hit() {
+        let checker = BloomDomainChecker::new(&["github.com".to_string()], 0.001).unwrap();
+        assert!(checker.check("a.b.github.com"));
+    }
+}
