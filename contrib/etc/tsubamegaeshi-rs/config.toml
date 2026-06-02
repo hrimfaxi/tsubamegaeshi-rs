@@ -7,6 +7,10 @@ special_upstream = "127.0.0.1:5353"
 # 国内dns地址
 domestic_upstream = "223.5.5.5"
 
+# 是否信任国内上游返回的 NODATA（NOERROR 且无对应记录）为真实结果，
+# 不再转查国外。默认 false。
+trust_domestic_nodata_reply = false
+
 # 国际dns地址
 foreign_upstream = "8.8.8.8"
 

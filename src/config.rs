@@ -58,6 +58,11 @@ pub struct Config {
     /// 0 表示放弃污染检查
     #[serde(default = "default_max_polluted_packets")]
     pub max_polluted_packets: usize,
+
+    /// 是否信任国内上游返回的 NODATA（NOERROR 且无对应记录）为真实结果，
+    /// 不再转查国外。默认 false。
+    #[serde(default)]
+    pub trust_domestic_nodata_reply: bool,
 }
 
 fn default_domestic_countries() -> Vec<String> {

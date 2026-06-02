@@ -54,6 +54,7 @@ pub struct DnsServer {
     pub domestic_countries: Vec<String>,
     pub pollution_checker: Option<PollutionChecker>,
     pub task_guard: Arc<TaskGuard>,
+    pub trust_domestic_nodata_reply: bool,
 }
 
 async fn bind_ephemeral_udp_for(upstream: &SocketAddr) -> std::io::Result<UdpSocket> {
@@ -456,56 +457,76 @@ impl DnsServer {
         domestic_resp: &Option<Vec<u8>>,
     ) -> bool {
         match domestic_resp {
-            Some(resp_bytes) => match Message::from_vec(resp_bytes) {
-                Ok(msg) => {
-                    match msg.answers().iter().find_map(|rr| {
-                        if rr.record_type() == RecordType::A {
-                            rr.data().and_then(|d| d.ip_addr())
+            Some(resp_bytes) => {
+                let msg = match Message::from_vec(resp_bytes) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(
+                            "Failed to parse domestic response for {}: {}",
+                            clean_domain, e
+                        );
+                        return false;
+                    }
+                };
+
+                // 如果是 NOERROR 且没有任何 A 记录，视为 NODATA
+                if msg.response_code() == ResponseCode::NoError
+                    && !msg
+                        .answers()
+                        .iter()
+                        .any(|rr| rr.record_type() == RecordType::A)
+                {
+                    if self.trust_domestic_nodata_reply {
+                        debug!("[DOMESTIC-NODATA-A] {} trusted, NODATA", clean_domain);
+                        return true;
+                    } else {
+                        debug!(
+                            "[DOMESTIC-NODATA-A] {} not trusted, fallback to foreign",
+                            clean_domain
+                        );
+                        return false;
+                    }
+                }
+
+                match msg.answers().iter().find_map(|rr| {
+                    if rr.record_type() == RecordType::A {
+                        rr.data().and_then(|d| d.ip_addr())
+                    } else {
+                        None
+                    }
+                }) {
+                    Some(ip) => {
+                        if let IpAddr::V4(v4) = ip {
+                            let v4_polluted = self
+                                .pollution_checker
+                                .as_ref()
+                                .map(|c| c.is_ipv4_polluted(&v4))
+                                .unwrap_or(false);
+                            if v4_polluted {
+                                debug!("[DOMESTIC-POLLUTED] {} {} -> foreign", clean_domain, ip);
+                                return false;
+                            }
+                        }
+                        let is_cn = self.is_domestic_country_ip(ip);
+                        if is_cn {
+                            debug!("[DOMESTIC-KEEP] {} ({} - China)", clean_domain, ip);
+                            true
                         } else {
-                            None
-                        }
-                    }) {
-                        Some(ip) => {
-                            if let IpAddr::V4(v4) = ip {
-                                let v4_polluted = self
-                                    .pollution_checker
-                                    .as_ref()
-                                    .map(|c| c.is_ipv4_polluted(&v4))
-                                    .unwrap_or(false);
-                                if v4_polluted {
-                                    debug!(
-                                        "[DOMESTIC-POLLUTED] {} {} -> foreign",
-                                        clean_domain, ip
-                                    );
-                                    return false;
-                                }
-                            }
-                            let is_cn = self.is_domestic_country_ip(ip);
-                            if is_cn {
-                                debug!("[DOMESTIC-KEEP] {} ({} - China)", clean_domain, ip);
-                                true
-                            } else {
-                                debug!(
-                                    "[DOMESTIC-REJECT] {} ({} - not China) -> foreign",
-                                    clean_domain, ip
-                                );
-                                false
-                            }
-                        }
-                        None => {
-                            debug!("[DOMESTIC-NO-IP] {} -> foreign", clean_domain);
+                            debug!(
+                                "[DOMESTIC-REJECT] {} ({} - not China) -> foreign",
+                                clean_domain, ip
+                            );
                             false
                         }
                     }
+                    None => {
+                        // 如果 NOERROR 但无 A 记录的处理已在上面分支，这里应该不会到达，
+                        // 但为安全仍返回 false
+                        debug!("[DOMESTIC-NO-IP] {} -> foreign", clean_domain);
+                        false
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        "Failed to parse domestic response for {}: {}",
-                        clean_domain, e
-                    );
-                    false
-                }
-            },
+            }
             None => {
                 warn!("[DOMESTIC-TIMEOUT] {} -> foreign", clean_domain);
                 false
@@ -520,47 +541,66 @@ impl DnsServer {
     ) -> bool {
         match domestic_resp {
             Some(data) => {
-                if let Ok(msg) = Message::from_vec(data) {
-                    let first_ipv6 = msg.answers().iter().find_map(|rr| {
-                        if rr.record_type() == RecordType::AAAA {
-                            rr.data().and_then(|d| d.ip_addr())
-                        } else {
-                            None
-                        }
-                    });
+                let msg = match Message::from_vec(data) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        debug!("[DOMESTIC-PARSE-ERR-AAAA] {} -> foreign", clean_domain);
+                        return false;
+                    }
+                };
 
-                    match first_ipv6 {
-                        Some(IpAddr::V6(ipv6)) => {
-                            let ipv6_polluted = self
-                                .pollution_checker
-                                .as_ref()
-                                .map(|c| c.is_ipv6_polluted(&ipv6))
-                                .unwrap_or(false);
-                            if ipv6_polluted {
-                                debug!(
-                                    "[DOMESTIC-POLLUTED-AAAA] {} ({}) -> foreign",
-                                    clean_domain, ipv6
-                                );
-                                false
-                            } else {
-                                debug!("[DOMESTIC-KEEP-AAAA] {} ({})", clean_domain, ipv6);
-                                true
-                            }
-                        }
+                // 如果是 NOERROR 且没有任何 AAAA 记录，视为 NODATA
+                if msg.response_code() == ResponseCode::NoError
+                    && !msg
+                        .answers()
+                        .iter()
+                        .any(|rr| rr.record_type() == RecordType::AAAA)
+                {
+                    if self.trust_domestic_nodata_reply {
+                        debug!("[DOMESTIC-NODATA-AAAA] {} trusted, NODATA", clean_domain);
+                        return true;
+                    } else {
+                        debug!(
+                            "[DOMESTIC-NODATA-AAAA] {} not trusted, fallback to foreign",
+                            clean_domain
+                        );
+                        return false;
+                    }
+                }
 
-                        Some(_) => true,
+                let first_ipv6 = msg.answers().iter().find_map(|rr| {
+                    if rr.record_type() == RecordType::AAAA {
+                        rr.data().and_then(|d| d.ip_addr())
+                    } else {
+                        None
+                    }
+                });
 
-                        None => {
-                            debug!("[DOMESTIC-NO-IP-AAAA] {} -> foreign", clean_domain);
+                match first_ipv6 {
+                    Some(IpAddr::V6(ipv6)) => {
+                        let ipv6_polluted = self
+                            .pollution_checker
+                            .as_ref()
+                            .map(|c| c.is_ipv6_polluted(&ipv6))
+                            .unwrap_or(false);
+                        if ipv6_polluted {
+                            debug!(
+                                "[DOMESTIC-POLLUTED-AAAA] {} ({}) -> foreign",
+                                clean_domain, ipv6
+                            );
                             false
+                        } else {
+                            debug!("[DOMESTIC-KEEP-AAAA] {} ({})", clean_domain, ipv6);
+                            true
                         }
                     }
-                } else {
-                    debug!("[DOMESTIC-PARSE-ERR-AAAA] {} -> foreign", clean_domain);
-                    false
+                    Some(_) => true,
+                    None => {
+                        debug!("[DOMESTIC-NO-IP-AAAA] {} -> foreign", clean_domain);
+                        false
+                    }
                 }
             }
-
             None => {
                 debug!("[DOMESTIC-TIMEOUT-AAAA] {} -> foreign", clean_domain);
                 false

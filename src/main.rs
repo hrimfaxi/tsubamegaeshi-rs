@@ -256,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
         domestic_countries: config.domestic_countries,
         pollution_checker,
         task_guard: task_guard.clone(),
+        trust_domestic_nodata_reply: config.trust_domestic_nodata_reply,
     });
 
     info!("tsubamegaeshi-rs started on {}", listen_text);
