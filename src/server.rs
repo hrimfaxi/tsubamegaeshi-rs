@@ -23,6 +23,7 @@ use crate::domain_utils::{canonical_domain, domain_matches_suffix, is_forced};
 use crate::gfwlist::BloomDomainChecker;
 use crate::mark_sites::{CommandNftManager, MarkGroup, MarkSites, NFT_SEM, NftManager};
 use crate::pollution::{PollutionChecker, PollutionResult, extract_answer_ips};
+use crate::task_guard::TaskGuard;
 
 pub struct RequestContext<'a> {
     pub kind: AddressQueryKind,
@@ -52,6 +53,7 @@ pub struct DnsServer {
     pub adblock_checker: Option<Arc<AdblockChecker>>,
     pub domestic_countries: Vec<String>,
     pub pollution_checker: Option<PollutionChecker>,
+    pub task_guard: Arc<TaskGuard>,
 }
 
 async fn bind_ephemeral_udp_for(upstream: &SocketAddr) -> std::io::Result<UdpSocket> {
@@ -223,7 +225,7 @@ impl DnsServer {
             return;
         };
 
-        tokio::task::spawn_blocking(move || {
+        self.task_guard.spawn_blocking(move || {
             let _permit = permit;
             for (table, ip) in entries {
                 if let Err(e) = nft_manager.as_ref().add_ip_to_group(&table, ip) {
@@ -765,7 +767,7 @@ impl DnsServer {
             let request = buf[..len].to_vec();
             let server = self.clone();
 
-            tokio::spawn(async move {
+            self.task_guard.spawn(|_| async move {
                 server.handle_request(request, src).await;
             });
         }

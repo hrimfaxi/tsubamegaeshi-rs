@@ -7,6 +7,7 @@ mod gfwlist;
 mod mark_sites;
 mod pollution;
 mod server;
+mod task_guard;
 
 use anyhow::Context;
 use clap::Parser;
@@ -28,6 +29,7 @@ use gfwlist::{BloomDomainChecker, GfwlistDecoder};
 use mark_sites::{CommandNftManager, MarkGroup, MarkRule, MarkSites, NFT_TABLE_PREFIX};
 use pollution::PollutionChecker;
 use server::{DnsServer, bind_listen_socket, parse_hosts, parse_upstream};
+use task_guard::TaskGuard;
 
 #[derive(Parser)]
 #[command(name = "tsubamegaeshi-rs", about = "燕返 - Lightweight DNS splitter")]
@@ -48,6 +50,8 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = toml::from_str(&config_str).context("Invalid config.toml")?;
 
     config.validate()?;
+
+    let task_guard = Arc::new(TaskGuard::new());
 
     let base = config
         .log_level
@@ -72,7 +76,9 @@ async fn main() -> anyhow::Result<()> {
         // 加载污染IP 列表
         let ipv4_path = config.ipv4_list.clone();
         let ipv6_path = config.ipv6_list.clone();
-        let (polluted_v4, polluted_v6) = tokio::task::spawn_blocking(move || {
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        task_guard.spawn_blocking(move || {
             let v4 = load_ip_set(&ipv4_path, |s| s.parse::<Ipv4Addr>().ok());
             let v6 = load_ip_set(&ipv6_path, |s| s.parse::<Ipv6Addr>().ok());
             info!(
@@ -80,9 +86,12 @@ async fn main() -> anyhow::Result<()> {
                 v4.len(),
                 v6.len()
             );
-            (v4, v6)
-        })
-        .await?;
+            let _ = tx.send((v4, v6));
+        });
+
+        let (polluted_v4, polluted_v6) = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("pollution load channel closed"))?;
 
         Some(PollutionChecker {
             v4: polluted_v4,
@@ -246,11 +255,23 @@ async fn main() -> anyhow::Result<()> {
         adblock_checker,
         domestic_countries: config.domestic_countries,
         pollution_checker,
+        task_guard: task_guard.clone(),
     });
 
     info!("tsubamegaeshi-rs started on {}", listen_text);
 
-    server.run().await;
+    tokio::select! {
+        _ = server.run() => {},
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received shutdown signal");
+        },
+    }
+
+    info!("Shutting down task guard...");
+    let clean = task_guard.shutdown(Duration::from_secs(5)).await;
+    if !clean {
+        warn!("Some tasks did not finish within shutdown timeout");
+    }
 
     Ok(())
 }

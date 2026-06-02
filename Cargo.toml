@@ -19,6 +19,7 @@ socket2 = "0.6.3"
 clap = { version = "4", features = ["derive"] }
 base64 = "0.21"
 bloomfilter = "3"
+tokio-util = "0.7.18"
 
 [profile.release]
 opt-level = "z"      # 比 "s" 更激进的体积优化
