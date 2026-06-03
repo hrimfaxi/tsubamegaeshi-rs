@@ -150,6 +150,7 @@ mod tests {
             ipv4_list: default_ipv4_list_path(),
             ipv6_list: default_ipv6_list_path(),
             max_polluted_packets: default_max_polluted_packets(),
+            trust_domestic_nodata_reply: false,
         }
     }
 
