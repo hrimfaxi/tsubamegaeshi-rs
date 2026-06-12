@@ -3,7 +3,7 @@ use hickory_proto::rr::rdata::svcb::{IpHint, SVCB, SvcParamKey, SvcParamValue};
 use hickory_proto::rr::rdata::{A as ARecord, AAAA as AAAARecord};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use tracing::{info, warn};
+use tracing::debug;
 
 use crate::pollution::extract_answer_ips;
 
@@ -222,16 +222,19 @@ pub fn rewrite_dns_id(data: &mut [u8], id: u16) {
     }
 }
 
-pub fn print_first_ip(resp: &[u8], tag: &str, domain: &str, upstream: &str) {
+pub fn debug_print_first_ip(resp: &[u8], tag: &str, domain: &str, upstream: &str) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
     // 统一从原始字节提取所有 IP（A/AAAA/HTTPS hints），取第一个打印
     if let Ok(ips) = extract_answer_ips(resp)
         && let Some(ip) = ips.first()
     {
-        info!("[{}] {} -> {} = {}", tag, domain, upstream, ip);
+        debug!("[{}] {} -> {} = {}", tag, domain, upstream, ip);
         return;
     }
 
-    warn!(
+    debug!(
         "[{}] {} -> {} (no A/AAAA/HTTPS answer)",
         tag, domain, upstream
     );

@@ -11,13 +11,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout_at};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::adblock::AdblockChecker;
 use crate::cache::DnsCache;
 use crate::dns_utils::{
     AddressQueryKind, build_a_response, build_aaaa_response, build_nodata_response,
-    build_servfail_response, print_first_ip,
+    build_servfail_response, debug_print_first_ip,
 };
 use crate::domain_utils::{canonical_domain, domain_matches_suffix, is_forced};
 use crate::gfwlist::BloomDomainChecker;
@@ -189,7 +189,7 @@ impl DnsServer {
             return;
         }
 
-        info!(
+        debug!(
             "[MARK_SITES] domain '{}' matched {} group(s): {:?}",
             clean_domain,
             matched_groups.len(),
@@ -249,7 +249,7 @@ impl DnsServer {
             AddressQueryKind::A => {
                 if let Some(ip) = self.hosts_v4.as_ref().and_then(|h| h.get(ctx.clean_domain)) {
                     let resp = build_a_response(ctx.query_msg, *ip, 60);
-                    info!("[HOSTS-A] {} -> {}", ctx.clean_domain, ip);
+                    debug!("[HOSTS-A] {} -> {}", ctx.clean_domain, ip);
                     let _ = self.socket.send_to(&resp, ctx.src).await;
                     return true;
                 }
@@ -259,7 +259,7 @@ impl DnsServer {
                     .as_ref()
                     .is_some_and(|h| h.contains_key(ctx.clean_domain))
                 {
-                    info!("[HOSTS-NO-A] {} (v6 only)", ctx.clean_domain);
+                    debug!("[HOSTS-NO-A] {} (v6 only)", ctx.clean_domain);
                     let nodata = build_nodata_response(ctx.query_msg);
                     let _ = self.socket.send_to(&nodata, ctx.src).await;
                     return true;
@@ -271,7 +271,7 @@ impl DnsServer {
             AddressQueryKind::Aaaa => {
                 if let Some(ip) = self.hosts_v6.as_ref().and_then(|h| h.get(ctx.clean_domain)) {
                     let resp = build_aaaa_response(ctx.query_msg, *ip, 60);
-                    info!("[HOSTS-AAAA] {} -> {}", ctx.clean_domain, ip);
+                    debug!("[HOSTS-AAAA] {} -> {}", ctx.clean_domain, ip);
                     let _ = self.socket.send_to(&resp, ctx.src).await;
                     return true;
                 }
@@ -281,7 +281,7 @@ impl DnsServer {
                     .as_ref()
                     .is_some_and(|h| h.contains_key(ctx.clean_domain))
                 {
-                    info!("[HOSTS-NO-AAAA] {} (v4 only)", ctx.clean_domain);
+                    debug!("[HOSTS-NO-AAAA] {} (v4 only)", ctx.clean_domain);
                     let nodata = build_nodata_response(ctx.query_msg);
                     let _ = self.socket.send_to(&nodata, ctx.src).await;
                     return true;
@@ -308,7 +308,7 @@ impl DnsServer {
                     .collect();
 
                 if !v4_hints.is_empty() || !v6_hints.is_empty() {
-                    info!(
+                    debug!(
                         "[HOSTS-HTTPS] {} -> custom hints IPv4: {:?}, IPv6: {:?}",
                         ctx.clean_domain, v4_hints, v6_hints
                     );
@@ -354,7 +354,7 @@ impl DnsServer {
 
         let upstream_str = upstream.to_string();
 
-        print_first_ip(&resp, tag, ctx.clean_domain, &upstream_str);
+        debug_print_first_ip(&resp, tag, ctx.clean_domain, &upstream_str);
 
         self.apply_mark_sites(&resp, ctx.clean_domain).await;
 
@@ -374,7 +374,7 @@ impl DnsServer {
             .foreign_query(ctx.request, ctx.query_msg, upstream, self.timeout)
             .await;
 
-        print_first_ip(&resp, tag, ctx.clean_domain, &upstream.to_string());
+        debug_print_first_ip(&resp, tag, ctx.clean_domain, &upstream.to_string());
 
         // 只有 NoError 的响应才缓存和打标
         self.cache_and_mark_if_ok(
@@ -391,7 +391,7 @@ impl DnsServer {
     pub async fn forward_by_static_rules(&self, ctx: &RequestContext<'_>) -> bool {
         for suffix in &self.special_suffixes {
             if domain_matches_suffix(ctx.clean_domain, suffix) {
-                info!(
+                debug!(
                     "[{}] {} -> dnsmasq",
                     ctx.kind.special_tag(),
                     ctx.clean_domain
@@ -421,7 +421,7 @@ impl DnsServer {
         }
 
         if is_forced(ctx.clean_domain, &self.force_foreign) {
-            info!(
+            debug!(
                 "[{}] {} -> {}",
                 ctx.kind.force_foreign_tag(),
                 ctx.clean_domain,
@@ -644,15 +644,15 @@ impl DnsServer {
         {
             let blocked_response = match ctx.kind {
                 AddressQueryKind::A => {
-                    info!("[ADBLOCK-A] {} -> 0.0.0.0", ctx.clean_domain);
+                    debug!("[ADBLOCK-A] {} -> 0.0.0.0", ctx.clean_domain);
                     build_a_response(ctx.query_msg, Ipv4Addr::new(0, 0, 0, 0), 60)
                 }
                 AddressQueryKind::Aaaa => {
-                    info!("[ADBLOCK-AAAA] {} -> ::", ctx.clean_domain);
+                    debug!("[ADBLOCK-AAAA] {} -> ::", ctx.clean_domain);
                     build_aaaa_response(ctx.query_msg, Ipv6Addr::UNSPECIFIED, 60)
                 }
                 AddressQueryKind::Https => {
-                    info!("[ADBLOCK-HTTPS] {} -> NODATA", ctx.clean_domain);
+                    debug!("[ADBLOCK-HTTPS] {} -> NODATA", ctx.clean_domain);
                     build_nodata_response(ctx.query_msg)
                 }
             };
@@ -717,7 +717,7 @@ impl DnsServer {
             )
         };
 
-        print_first_ip(&final_resp, chosen_tag, ctx.clean_domain, &chosen_upstream);
+        debug_print_first_ip(&final_resp, chosen_tag, ctx.clean_domain, &chosen_upstream);
 
         self.cache_and_mark_if_ok(
             &final_resp,
