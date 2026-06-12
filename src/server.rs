@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout_at};
@@ -55,6 +56,8 @@ pub struct DnsServer {
     pub pollution_checker: Option<PollutionChecker>,
     pub task_guard: Arc<TaskGuard>,
     pub trust_domestic_nodata_reply: bool,
+    pub max_in_flight: usize,
+    pub in_flight: AtomicUsize,
 }
 
 async fn bind_ephemeral_udp_for(upstream: &SocketAddr) -> std::io::Result<UdpSocket> {
@@ -794,6 +797,13 @@ impl DnsServer {
     pub async fn run(self: Arc<Self>) {
         let mut buf = [0u8; 4096];
 
+        struct Guard(Arc<DnsServer>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
         loop {
             let (len, src) = match self.socket.recv_from(&mut buf).await {
                 Ok(v) => v,
@@ -804,11 +814,21 @@ impl DnsServer {
                 }
             };
 
+            let prev = self.in_flight.fetch_add(1, Ordering::Relaxed);
+            if prev >= self.max_in_flight {
+                self.in_flight.fetch_sub(1, Ordering::Relaxed);
+                debug!("IN_FLIGHT full, dropping packet from {}", src);
+                continue;
+            }
+
             let request = buf[..len].to_vec();
             let server = self.clone();
 
             self.task_guard.spawn(|_| async move {
-                server.handle_request(request, src).await;
+                let _guard = Guard(server.clone());
+                let _ =
+                    tokio::time::timeout(server.timeout * 3, server.handle_request(request, src))
+                        .await;
             });
         }
     }

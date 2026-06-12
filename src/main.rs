@@ -18,6 +18,7 @@ use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -257,6 +258,8 @@ async fn main() -> anyhow::Result<()> {
         pollution_checker,
         task_guard: task_guard.clone(),
         trust_domestic_nodata_reply: config.trust_domestic_nodata_reply,
+        max_in_flight: config.max_in_flight,
+        in_flight: AtomicUsize::new(0),
     });
 
     info!("tsubamegaeshi-rs started on {}", listen_text);

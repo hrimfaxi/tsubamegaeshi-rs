@@ -1,3 +1,4 @@
+use anyhow::bail;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -63,6 +64,10 @@ pub struct Config {
     /// 不再转查国外。默认 false。
     #[serde(default)]
     pub trust_domestic_nodata_reply: bool,
+
+    /// 最大并发请求数, 防止tproxy成环用, 默认 128
+    #[serde(default = "default_max_in_flight")]
+    pub max_in_flight: usize,
 }
 
 fn default_domestic_countries() -> Vec<String> {
@@ -81,28 +86,36 @@ fn default_max_polluted_packets() -> usize {
     5
 }
 
+fn default_max_in_flight() -> usize {
+    128
+}
+
 impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.max_in_flight == 0 {
+            bail!("max_in_flight must be > 0");
+        }
+
         if self.query_timeout_sec == 0 {
-            anyhow::bail!("query_timeout_sec must be greater than 0");
+            bail!("query_timeout_sec must be greater than 0");
         }
 
         if let Some(rate) = self.gfbloom_fp_rate
             && !(rate > 0.0 && rate < 1.0)
         {
-            anyhow::bail!("gfbloom_fp_rate must be greater than 0.0 and less than 1.0");
+            bail!("gfbloom_fp_rate must be greater than 0.0 and less than 1.0");
         }
 
         if let Some(marksite) = &self.marksite {
             for table in marksite.keys() {
                 if table.is_empty() {
-                    anyhow::bail!("marksite table suffix cannot be empty");
+                    bail!("marksite table suffix cannot be empty");
                 }
                 if !table
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
                 {
-                    anyhow::bail!(
+                    bail!(
                         "invalid marksite table suffix '{}': only ASCII letters, digits, '_' and '-' are allowed",
                         table
                     );
@@ -113,7 +126,7 @@ impl Config {
         if let Some(rate) = self.adblock_fp_rate
             && !(rate > 0.0 && rate < 1.0)
         {
-            anyhow::bail!("adblock_fp_rate must be between 0.0 and 1.0");
+            bail!("adblock_fp_rate must be between 0.0 and 1.0");
         }
 
         Ok(())
@@ -151,6 +164,7 @@ mod tests {
             ipv6_list: default_ipv6_list_path(),
             max_polluted_packets: default_max_polluted_packets(),
             trust_domestic_nodata_reply: false,
+            max_in_flight: 128,
         }
     }
 
