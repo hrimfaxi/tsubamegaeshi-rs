@@ -20,6 +20,7 @@ pub struct Config {
     pub foreign_upstream: String,
     pub mmdb_path: String,
     pub cache_size: usize,
+    #[serde(default = "default_query_timeout_sec")]
     pub query_timeout_sec: u64,
     pub enable_ipv6_aaaa: bool,
     pub log_level: Option<String>,
@@ -90,6 +91,10 @@ fn default_max_in_flight() -> usize {
     128
 }
 
+fn default_query_timeout_sec() -> u64 {
+    10
+}
+
 impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.max_in_flight == 0 {
@@ -126,7 +131,7 @@ impl Config {
         if let Some(rate) = self.adblock_fp_rate
             && !(rate > 0.0 && rate < 1.0)
         {
-            bail!("adblock_fp_rate must be between 0.0 and 1.0");
+            bail!("adblock_fp_rate must be greater than 0.0 and less than 1.0");
         }
 
         Ok(())

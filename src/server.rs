@@ -924,7 +924,7 @@ impl DnsServer {
     }
 
     pub async fn send_dns_query(&self, request: &[u8], upstream: &SocketAddr) -> Option<Vec<u8>> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + self.timeout;
         let mut attempt = 0;
         let mut last_error: Option<String> = None;
 
