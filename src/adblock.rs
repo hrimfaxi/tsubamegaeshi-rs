@@ -66,7 +66,7 @@ impl AdblockDecoder {
 }
 
 pub struct AdblockChecker {
-    bloom: Bloom<Vec<u8>>,
+    bloom: Bloom<str>,
     exact: HashSet<String>,
 }
 
@@ -76,13 +76,13 @@ impl AdblockChecker {
         if num == 0 {
             anyhow::bail!("No adblock domains");
         }
-        let mut bloom = Bloom::<Vec<u8>>::new_for_fp_rate(num, fp_rate)
+        let mut bloom = Bloom::<str>::new_for_fp_rate(num, fp_rate)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         let mut exact = HashSet::with_capacity(num);
         for domain in domains {
             let domain = canonical_domain(domain);
-            bloom.set(&domain.as_bytes().to_vec());
+            bloom.set(&domain);
             exact.insert(domain);
         }
 
@@ -95,9 +95,8 @@ impl AdblockChecker {
 
         for i in 0..parts.len().saturating_sub(1) {
             let candidate = parts[i..].join(".");
-            let key = candidate.as_bytes().to_vec();
 
-            if self.bloom.check(&key) && self.exact.contains(&candidate) {
+            if self.bloom.check(&candidate) && self.exact.contains(&candidate) {
                 return true;
             }
         }

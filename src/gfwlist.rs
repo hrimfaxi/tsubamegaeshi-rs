@@ -68,7 +68,7 @@ impl GfwlistDecoder {
 
 /// 基于布隆过滤器的域名检测器
 pub struct BloomDomainChecker {
-    filter: Bloom<Vec<u8>>,
+    filter: Bloom<str>,
 }
 
 impl BloomDomainChecker {
@@ -79,12 +79,12 @@ impl BloomDomainChecker {
             anyhow::bail!("没有提供任何域名，无法构建布隆过滤器");
         }
 
-        let mut filter = Bloom::<Vec<u8>>::new_for_fp_rate(num_items, fp_rate)
+        let mut filter = Bloom::<str>::new_for_fp_rate(num_items, fp_rate)
             .map_err(|e| anyhow::anyhow!("创建布隆过滤器失败: {}", e))?;
 
         for domain in domains {
             let domain = canonical_domain(domain);
-            filter.set(&domain.as_bytes().to_vec());
+            filter.set(&domain);
         }
 
         Ok(Self { filter })
@@ -96,7 +96,7 @@ impl BloomDomainChecker {
 
         for i in 0..parts.len().saturating_sub(1) {
             let key = parts[i..].join(".");
-            if self.filter.check(&key.as_bytes().to_vec()) {
+            if self.filter.check(&key) {
                 return true;
             }
         }
