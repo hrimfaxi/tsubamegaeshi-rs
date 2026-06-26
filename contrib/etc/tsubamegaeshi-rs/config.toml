@@ -28,6 +28,7 @@ enable_ipv6_aaaa = false
 gfwlist_path = "/etc/tsubamegaeshi-rs/gfwlist.txt"
 mmdb_path = "/etc/tsubamegaeshi-rs/Country-only-cn-private.mmdb"
 gfbloom_fp_rate = 0.001
+domestic_countries = ["CN"]
 
 # 污染 IPv4 地址列表文件路径
 ipv4_list = "/etc/tsubamegaeshi-rs/ipv4.txt"
