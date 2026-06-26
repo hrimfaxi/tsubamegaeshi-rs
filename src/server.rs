@@ -960,8 +960,8 @@ impl DnsServer {
 
         if let Some(err) = last_error {
             warn!(
-                "DNS query to {} failed after {} attempt(s) within 10 seconds: {}",
-                upstream, attempt, err
+                "DNS query to {} failed after {} attempt(s) within {:?}: {}",
+                upstream, attempt, self.timeout, err
             );
         }
         None
