@@ -91,17 +91,15 @@ impl AdblockChecker {
 
     pub fn check(&self, domain: &str) -> bool {
         let domain = canonical_domain(domain);
-        let mut parts: Vec<&str> = domain.split('.').collect();
+        let parts: Vec<&str> = domain.split('.').collect();
 
-        while parts.len() >= 2 {
-            let candidate = parts.join(".");
+        for i in 0..parts.len().saturating_sub(1) {
+            let candidate = parts[i..].join(".");
             let key = candidate.as_bytes().to_vec();
 
             if self.bloom.check(&key) && self.exact.contains(&candidate) {
                 return true;
             }
-
-            parts.remove(0);
         }
 
         false

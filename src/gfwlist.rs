@@ -92,17 +92,13 @@ impl BloomDomainChecker {
 
     pub fn check(&self, domain: &str) -> bool {
         let domain = canonical_domain(domain);
-        let mut parts: Vec<&str> = domain.split('.').collect();
+        let parts: Vec<&str> = domain.split('.').collect();
 
-        // 至少保留 2 段，例如 google.com
-        while parts.len() >= 2 {
-            let key = parts.join(".");
+        for i in 0..parts.len().saturating_sub(1) {
+            let key = parts[i..].join(".");
             if self.filter.check(&key.as_bytes().to_vec()) {
                 return true;
             }
-
-            // 去掉最左侧子域名
-            parts.remove(0);
         }
 
         false
