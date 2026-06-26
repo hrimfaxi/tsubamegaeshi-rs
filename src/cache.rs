@@ -2,12 +2,13 @@ use crate::dns_utils::response_cache_ttl;
 use hickory_proto::op::Message;
 use lru::LruCache;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::debug;
 
 pub struct CacheEntry {
-    pub data: Vec<u8>,
+    pub data: Arc<Vec<u8>>,
     pub expire: Instant,
 }
 
@@ -49,7 +50,8 @@ impl DnsCache {
             data
         };
 
-        let mut data = cached_data?;
+        let data = cached_data?;
+        let mut data = Arc::try_unwrap(data).unwrap_or_else(|arc| (*arc).clone());
         crate::dns_utils::rewrite_dns_id(&mut data, req_id);
         Some(data)
     }
@@ -82,7 +84,7 @@ impl DnsCache {
         cache.put(
             (domain.to_string(), qtype_num),
             CacheEntry {
-                data: response.to_vec(),
+                data: Arc::new(response.to_vec()),
                 expire,
             },
         );
@@ -110,7 +112,13 @@ mod tests {
             expire: Instant,
         ) {
             let mut cache = self.inner.lock().await;
-            cache.put((domain.to_string(), qtype), CacheEntry { data, expire });
+            cache.put(
+                (domain.to_string(), qtype),
+                CacheEntry {
+                    data: Arc::new(data),
+                    expire,
+                },
+            );
         }
     }
 

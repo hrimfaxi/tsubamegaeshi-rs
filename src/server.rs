@@ -215,9 +215,7 @@ impl DnsServer {
         );
 
         let mut ips = HashSet::new();
-        if let Ok(_msg) = Message::from_vec(final_resp)
-            && let Ok(all_ips) = extract_answer_ips(final_resp)
-        {
+        if let Ok(all_ips) = extract_answer_ips(final_resp) {
             for ip in all_ips {
                 ips.insert(ip);
             }
@@ -1057,17 +1055,16 @@ impl DnsServer {
     ) -> bool {
         match domestic_resp {
             Some(data) => {
-                if let Ok(_msg) = Message::from_vec(data) {
-                    let all_hints = extract_answer_ips(data).unwrap_or_default();
-                    if all_hints.is_empty() {
-                        debug!("[DOMESTIC-HTTPS] {} no hints -> keep", clean_domain);
-                        return true;
-                    } else {
-                        debug!(
-                            "[HTTPS-DEBUG] {} domestic hints: {:?}",
-                            clean_domain, all_hints
-                        );
-                    }
+                let all_hints = extract_answer_ips(data).unwrap_or_default();
+                if all_hints.is_empty() {
+                    debug!("[DOMESTIC-HTTPS] {} no hints -> keep", clean_domain);
+                    return true;
+                } else {
+                    debug!(
+                        "[HTTPS-DEBUG] {} domestic hints: {:?}",
+                        clean_domain, all_hints
+                    );
+                }
                     for ip in all_hints {
                         match ip {
                             IpAddr::V4(v4) => {
@@ -1102,11 +1099,7 @@ impl DnsServer {
                     }
                     debug!("[DOMESTIC-HTTPS-KEEP] {} all hints domestic", clean_domain);
                     true
-                } else {
-                    debug!("[DOMESTIC-HTTPS-PARSE-ERR] {} -> foreign", clean_domain);
-                    false
                 }
-            }
             None => {
                 debug!("[DOMESTIC-HTTPS-TIMEOUT] {} -> foreign", clean_domain);
                 false
