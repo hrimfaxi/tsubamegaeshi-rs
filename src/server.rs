@@ -2,7 +2,7 @@ use anyhow::Context;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::RecordType;
 use maxminddb::Reader;
-use maxminddb::geoip2::Country;
+use serde::Deserialize;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -25,6 +25,18 @@ use crate::gfwlist::BloomDomainChecker;
 use crate::mark_sites::{CommandNftManager, MarkGroup, MarkSites, NFT_SEM, NftManager};
 use crate::pollution::{PollutionChecker, PollutionResult, extract_answer_ips};
 use crate::task_guard::TaskGuard;
+
+#[derive(Deserialize)]
+struct MinimalMmdb<'a> {
+    #[serde(borrow, default)]
+    country: MinimalCountry<'a>,
+}
+
+#[derive(Deserialize, Default)]
+struct MinimalCountry<'a> {
+    #[serde(borrow, default)]
+    iso_code: Option<&'a str>,
+}
 
 pub struct RequestContext<'a> {
     pub kind: AddressQueryKind,
@@ -1022,12 +1034,12 @@ impl DnsServer {
             Err(_) => return false,
         };
 
-        let country = match lookup_result.decode::<Country>() {
-            Ok(Some(c)) => c,
+        let record = match lookup_result.decode::<MinimalMmdb<'_>>() {
+            Ok(Some(r)) => r,
             _ => return false,
         };
 
-        country
+        record
             .country
             .iso_code
             .map(|code| {
