@@ -26,27 +26,35 @@ pub fn normalize_domain_list(items: Option<Vec<String>>) -> Option<Vec<String>> 
 ///
 /// 不匹配：
 /// - `badexample.com` 不应匹配 `example.com`
-pub fn domain_matches_suffix(domain: &str, suffix: &str) -> bool {
+///
+/// 注意：会为两个输入各分配一个 String 做规范化。
+/// 如果输入已规范化，请使用 `domain_matches_suffix_canonical`。
+#[cfg(test)]
+fn domain_matches_suffix(domain: &str, suffix: &str) -> bool {
     let d_norm = canonical_domain(domain);
     let s_norm = canonical_domain(suffix);
+    domain_matches_suffix_canonical(&d_norm, &s_norm)
+}
 
-    let d_len = d_norm.len();
-    let s_len = s_norm.len();
+/// 后缀匹配的内部实现，假设两个输入都已规范化（小写、无尾部点号）。
+pub(crate) fn domain_matches_suffix_canonical(domain: &str, suffix: &str) -> bool {
+    let d_len = domain.len();
+    let s_len = suffix.len();
 
-    // 2. 长度边界短路
+    // 长度边界短路
     if d_len < s_len {
         return false;
     }
 
-    // 3. 规范化后完全相等 (例如 domain: "google.com", suffix: "google.com")
+    // 规范化后完全相等 (例如 domain: "google.com", suffix: "google.com")
     if d_len == s_len {
-        return d_norm == s_norm;
+        return domain == suffix;
     }
 
-    // 4. 处理子域名后缀匹配 (例如 domain: "www.google.com", suffix: "google.com")
-    if d_norm.ends_with(&s_norm) {
+    // 处理子域名后缀匹配 (例如 domain: "www.google.com", suffix: "google.com")
+    if domain.ends_with(suffix) {
         let prev_char_idx = d_len - s_len - 1;
-        if let Some(c) = d_norm.as_bytes().get(prev_char_idx) {
+        if let Some(c) = domain.as_bytes().get(prev_char_idx) {
             return *c == b'.';
         }
     }
@@ -272,10 +280,61 @@ mod tests {
         let list = Some(vec!["Google.COM".to_string()]);
         assert!(is_forced("www.google.com", &list));
     }
+
+    // ========== domain_matches_suffix_canonical ==========
+
+    #[test]
+    fn test_canonical_exact() {
+        assert!(domain_matches_suffix_canonical("google.com", "google.com"));
+    }
+
+    #[test]
+    fn test_canonical_subdomain() {
+        assert!(domain_matches_suffix_canonical(
+            "www.google.com",
+            "google.com"
+        ));
+    }
+
+    #[test]
+    fn test_canonical_not_subdomain() {
+        assert!(!domain_matches_suffix_canonical(
+            "notgoogle.com",
+            "google.com"
+        ));
+    }
+
+    #[test]
+    fn test_canonical_shorter() {
+        assert!(!domain_matches_suffix_canonical("com", "google.com"));
+    }
+
+    // ========== is_forced_canonical ==========
+
+    #[test]
+    fn test_is_forced_canonical_none() {
+        assert!(!is_forced_canonical("google.com", &None));
+    }
+
+    #[test]
+    fn test_is_forced_canonical_hit() {
+        let list = Some(vec!["google.com".to_string()]);
+        assert!(is_forced_canonical("www.google.com", &list));
+    }
+
+    #[test]
+    fn test_is_forced_canonical_miss() {
+        let list = Some(vec!["google.com".to_string()]);
+        assert!(!is_forced_canonical("example.org", &list));
+    }
 }
 
 /// 检查域名是否匹配强制列表中的任一条目。
-pub fn is_forced(domain: &str, list: &Option<Vec<String>>) -> bool {
+///
+/// 注意：会为每个 pattern 分配一个 String 做规范化。
+/// 如果 domain 已规范化，请使用 `is_forced_canonical`。
+#[cfg(test)]
+fn is_forced(domain: &str, list: &Option<Vec<String>>) -> bool {
     let Some(items) = list else {
         return false;
     };
@@ -283,4 +342,16 @@ pub fn is_forced(domain: &str, list: &Option<Vec<String>>) -> bool {
     items
         .iter()
         .any(|pattern| domain_matches_suffix(domain, pattern))
+}
+
+/// 检查域名是否匹配强制列表中的任一条目。
+/// 与 `is_forced` 相同，但假设 domain 已规范化，跳过 `canonical_domain` 分配。
+pub fn is_forced_canonical(domain: &str, list: &Option<Vec<String>>) -> bool {
+    let Some(items) = list else {
+        return false;
+    };
+
+    items
+        .iter()
+        .any(|pattern| domain_matches_suffix_canonical(domain, pattern))
 }

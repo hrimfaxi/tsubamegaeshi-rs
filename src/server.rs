@@ -20,7 +20,7 @@ use crate::dns_utils::{
     AddressQueryKind, build_a_response, build_aaaa_response, build_nodata_response,
     build_servfail_response, debug_print_first_ip,
 };
-use crate::domain_utils::{canonical_domain, domain_matches_suffix, is_forced};
+use crate::domain_utils::{canonical_domain, domain_matches_suffix_canonical, is_forced_canonical};
 use crate::gfwlist::BloomDomainChecker;
 use crate::mark_sites::{CommandNftManager, MarkGroup, MarkSites, NFT_SEM, NftManager};
 use crate::pollution::{PollutionChecker, PollutionResult, extract_answer_ips};
@@ -397,7 +397,7 @@ impl DnsServer {
 
     pub async fn forward_by_static_rules(&self, ctx: &RequestContext<'_>) -> bool {
         for suffix in &self.special_suffixes {
-            if domain_matches_suffix(ctx.clean_domain, suffix) {
+            if domain_matches_suffix_canonical(ctx.clean_domain, suffix) {
                 debug!(
                     "[{}] {} -> dnsmasq",
                     ctx.kind.special_tag(),
@@ -412,7 +412,7 @@ impl DnsServer {
             }
         }
 
-        if is_forced(ctx.clean_domain, &self.force_domestic) {
+        if is_forced_canonical(ctx.clean_domain, &self.force_domestic) {
             debug!(
                 "[{}] {} -> {}",
                 ctx.kind.force_domestic_tag(),
@@ -427,7 +427,7 @@ impl DnsServer {
             return true;
         }
 
-        if is_forced(ctx.clean_domain, &self.force_foreign) {
+        if is_forced_canonical(ctx.clean_domain, &self.force_foreign) {
             debug!(
                 "[{}] {} -> {}",
                 ctx.kind.force_foreign_tag(),
