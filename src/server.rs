@@ -698,6 +698,16 @@ impl DnsServer {
 
         let (final_resp, chosen_tag, chosen_upstream) = if use_domestic {
             let resp = domestic_resp.expect("domestic_resp must be Some when use_domestic is true");
+            // 复用已解析的 Message 做缓存和打标，避免重复解析
+            if let Ok(msg) = Message::from_vec(&resp) {
+                self.cache_and_mark_if_ok_msg(
+                    &msg,
+                    &resp,
+                    ctx.clean_domain,
+                    ctx.kind.cache_qtype(),
+                )
+                .await;
+            }
             (resp, ctx.kind.domestic_tag(), &self.domestic_upstream)
         } else {
             let resp = self
@@ -708,17 +718,14 @@ impl DnsServer {
                     self.timeout,
                 )
                 .await;
+            self.cache_and_mark_if_ok(&resp, ctx.clean_domain, ctx.kind.cache_qtype())
+                .await;
             (resp, ctx.kind.foreign_tag(), &self.foreign_upstream)
         };
 
         debug_print_first_ip(&final_resp, chosen_tag, ctx.clean_domain, chosen_upstream);
 
-        self.cache_and_mark_if_ok(&final_resp, ctx.clean_domain, ctx.kind.cache_qtype())
-            .await;
-
         let _ = self.socket.send_to(&final_resp, ctx.src).await;
-
-        self.apply_mark_sites(&final_resp, ctx.clean_domain).await;
     }
 
     pub async fn send_cached_response(
@@ -1090,6 +1097,18 @@ impl DnsServer {
         {
             if let Some(cache) = &self.cache
                 && let Some(ttl) = response_cache_ttl(&msg)
+            {
+                cache.put_with_ttl(domain, qtype, resp, ttl).await;
+            }
+            self.apply_mark_sites(resp, domain).await;
+        }
+    }
+
+    /// 同 cache_and_mark_if_ok，但接受已解析的 Message 避免重复解析
+    async fn cache_and_mark_if_ok_msg(&self, msg: &Message, resp: &[u8], domain: &str, qtype: u16) {
+        if msg.response_code() == ResponseCode::NoError {
+            if let Some(cache) = &self.cache
+                && let Some(ttl) = response_cache_ttl(msg)
             {
                 cache.put_with_ttl(domain, qtype, resp, ttl).await;
             }
