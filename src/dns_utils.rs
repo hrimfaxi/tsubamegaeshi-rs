@@ -222,14 +222,26 @@ pub fn rewrite_dns_id(data: &mut [u8], id: u16) {
     }
 }
 
-pub fn debug_print_first_ip(resp: &[u8], tag: &str, domain: &str, upstream: &std::net::SocketAddr) {
+pub fn debug_print_first_ip(
+    resp: &[u8],
+    tag: &str,
+    domain: &str,
+    upstream: &std::net::SocketAddr,
+    precomputed_ips: Option<&[std::net::IpAddr]>,
+) {
     if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
     }
     // 统一从原始字节提取所有 IP（A/AAAA/HTTPS hints），取第一个打印
-    if let Ok(ips) = extract_answer_ips(resp)
-        && let Some(ip) = ips.first()
-    {
+    let ips;
+    let ip_list = match precomputed_ips {
+        Some(p) => p,
+        None => {
+            ips = extract_answer_ips(resp).unwrap_or_default();
+            &ips
+        }
+    };
+    if let Some(ip) = ip_list.first() {
         debug!("[{}] {} -> {} = {}", tag, domain, upstream, ip);
         return;
     }

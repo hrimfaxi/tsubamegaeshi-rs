@@ -194,6 +194,16 @@ impl DnsServer {
     }
 
     pub async fn apply_mark_sites(&self, final_resp: &[u8], clean_domain: &str) {
+        self.apply_mark_sites_inner(final_resp, clean_domain, None)
+            .await;
+    }
+
+    async fn apply_mark_sites_inner(
+        &self,
+        final_resp: &[u8],
+        clean_domain: &str,
+        precomputed_ips: Option<Vec<IpAddr>>,
+    ) {
         let Some(mark_sites) = &self.mark_sites else {
             return;
         };
@@ -214,9 +224,12 @@ impl DnsServer {
                 .collect::<Vec<_>>()
         );
 
-        let all_ips = match extract_answer_ips(final_resp) {
-            Ok(ips) if !ips.is_empty() => ips,
-            _ => return,
+        let all_ips = match precomputed_ips {
+            Some(ips) if !ips.is_empty() => ips,
+            _ => match extract_answer_ips(final_resp) {
+                Ok(ips) if !ips.is_empty() => ips,
+                _ => return,
+            },
         };
 
         let ips: HashSet<IpAddr> = all_ips.into_iter().collect();
@@ -361,7 +374,7 @@ impl DnsServer {
             .forward_to_upstream_and_get(ctx.request, ctx.query_msg, upstream, &ctx.src)
             .await;
 
-        debug_print_first_ip(&resp, tag, ctx.clean_domain, upstream);
+        debug_print_first_ip(&resp, tag, ctx.clean_domain, upstream, None);
 
         self.apply_mark_sites(&resp, ctx.clean_domain).await;
 
@@ -381,7 +394,7 @@ impl DnsServer {
             .foreign_query(ctx.request, ctx.query_msg, upstream, self.timeout)
             .await;
 
-        debug_print_first_ip(&resp, tag, ctx.clean_domain, upstream);
+        debug_print_first_ip(&resp, tag, ctx.clean_domain, upstream, None);
 
         // 只有 NoError 的响应才缓存和打标
         self.cache_and_mark_if_ok(&resp, ctx.clean_domain, ctx.kind.cache_qtype())
@@ -723,7 +736,13 @@ impl DnsServer {
             (resp, ctx.kind.foreign_tag(), &self.foreign_upstream)
         };
 
-        debug_print_first_ip(&final_resp, chosen_tag, ctx.clean_domain, chosen_upstream);
+        debug_print_first_ip(
+            &final_resp,
+            chosen_tag,
+            ctx.clean_domain,
+            chosen_upstream,
+            None,
+        );
 
         let _ = self.socket.send_to(&final_resp, ctx.src).await;
     }
@@ -1095,24 +1114,26 @@ impl DnsServer {
         if let Ok(msg) = Message::from_vec(resp)
             && msg.response_code() == ResponseCode::NoError
         {
+            let ips = extract_answer_ips(resp).ok();
             if let Some(cache) = &self.cache
                 && let Some(ttl) = response_cache_ttl(&msg)
             {
                 cache.put_with_ttl(domain, qtype, resp, ttl).await;
             }
-            self.apply_mark_sites(resp, domain).await;
+            self.apply_mark_sites_inner(resp, domain, ips).await;
         }
     }
 
     /// 同 cache_and_mark_if_ok，但接受已解析的 Message 避免重复解析
     async fn cache_and_mark_if_ok_msg(&self, msg: &Message, resp: &[u8], domain: &str, qtype: u16) {
         if msg.response_code() == ResponseCode::NoError {
+            let ips = extract_answer_ips(resp).ok();
             if let Some(cache) = &self.cache
                 && let Some(ttl) = response_cache_ttl(msg)
             {
                 cache.put_with_ttl(domain, qtype, resp, ttl).await;
             }
-            self.apply_mark_sites(resp, domain).await;
+            self.apply_mark_sites_inner(resp, domain, ips).await;
         }
     }
 }
