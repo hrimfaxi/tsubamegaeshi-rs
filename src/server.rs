@@ -365,9 +365,7 @@ impl DnsServer {
             .forward_to_upstream_and_get(ctx.request, ctx.query_msg, upstream, &ctx.src)
             .await;
 
-        let upstream_str = upstream.to_string();
-
-        debug_print_first_ip(&resp, tag, ctx.clean_domain, &upstream_str);
+        debug_print_first_ip(&resp, tag, ctx.clean_domain, upstream);
 
         self.apply_mark_sites(&resp, ctx.clean_domain).await;
 
@@ -387,7 +385,7 @@ impl DnsServer {
             .foreign_query(ctx.request, ctx.query_msg, upstream, self.timeout)
             .await;
 
-        debug_print_first_ip(&resp, tag, ctx.clean_domain, &upstream.to_string());
+        debug_print_first_ip(&resp, tag, ctx.clean_domain, upstream);
 
         // 只有 NoError 的响应才缓存和打标
         self.cache_and_mark_if_ok(
@@ -709,11 +707,7 @@ impl DnsServer {
 
         let (final_resp, chosen_tag, chosen_upstream) = if use_domestic {
             let resp = domestic_resp.expect("domestic_resp must be Some when use_domestic is true");
-            (
-                resp,
-                ctx.kind.domestic_tag(),
-                self.domestic_upstream.to_string(),
-            )
+            (resp, ctx.kind.domestic_tag(), &self.domestic_upstream)
         } else {
             let resp = self
                 .foreign_query(
@@ -723,14 +717,10 @@ impl DnsServer {
                     self.timeout,
                 )
                 .await;
-            (
-                resp,
-                ctx.kind.foreign_tag(),
-                self.foreign_upstream.to_string(),
-            )
+            (resp, ctx.kind.foreign_tag(), &self.foreign_upstream)
         };
 
-        debug_print_first_ip(&final_resp, chosen_tag, ctx.clean_domain, &chosen_upstream);
+        debug_print_first_ip(&final_resp, chosen_tag, ctx.clean_domain, chosen_upstream);
 
         self.cache_and_mark_if_ok(
             &final_resp,
@@ -1065,41 +1055,41 @@ impl DnsServer {
                         clean_domain, all_hints
                     );
                 }
-                    for ip in all_hints {
-                        match ip {
-                            IpAddr::V4(v4) => {
-                                let v4_polluted = self
-                                    .pollution_checker
-                                    .as_ref()
-                                    .map(|c| c.is_ipv4_polluted(&v4))
-                                    .unwrap_or(false);
-                                if v4_polluted || !self.is_domestic_country_ip(ip) {
-                                    debug!(
-                                        "[DOMESTIC-HTTPS-REJECT] {} IPv4 {} not domestic -> foreign",
-                                        clean_domain, v4
-                                    );
-                                    return false;
-                                }
+                for ip in all_hints {
+                    match ip {
+                        IpAddr::V4(v4) => {
+                            let v4_polluted = self
+                                .pollution_checker
+                                .as_ref()
+                                .map(|c| c.is_ipv4_polluted(&v4))
+                                .unwrap_or(false);
+                            if v4_polluted || !self.is_domestic_country_ip(ip) {
+                                debug!(
+                                    "[DOMESTIC-HTTPS-REJECT] {} IPv4 {} not domestic -> foreign",
+                                    clean_domain, v4
+                                );
+                                return false;
                             }
-                            IpAddr::V6(v6) => {
-                                let v6_polluted = self
-                                    .pollution_checker
-                                    .as_ref()
-                                    .map(|c| c.is_ipv6_polluted(&v6))
-                                    .unwrap_or(false);
-                                if v6_polluted || !self.is_domestic_country_ip(ip) {
-                                    debug!(
-                                        "[DOMESTIC-HTTPS-REJECT] {} IPv6 {} polluted/not domestic -> foreign",
-                                        clean_domain, v6
-                                    );
-                                    return false;
-                                }
+                        }
+                        IpAddr::V6(v6) => {
+                            let v6_polluted = self
+                                .pollution_checker
+                                .as_ref()
+                                .map(|c| c.is_ipv6_polluted(&v6))
+                                .unwrap_or(false);
+                            if v6_polluted || !self.is_domestic_country_ip(ip) {
+                                debug!(
+                                    "[DOMESTIC-HTTPS-REJECT] {} IPv6 {} polluted/not domestic -> foreign",
+                                    clean_domain, v6
+                                );
+                                return false;
                             }
                         }
                     }
-                    debug!("[DOMESTIC-HTTPS-KEEP] {} all hints domestic", clean_domain);
-                    true
                 }
+                debug!("[DOMESTIC-HTTPS-KEEP] {} all hints domestic", clean_domain);
+                true
+            }
             None => {
                 debug!("[DOMESTIC-HTTPS-TIMEOUT] {} -> foreign", clean_domain);
                 false

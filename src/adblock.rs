@@ -76,8 +76,8 @@ impl AdblockChecker {
         if num == 0 {
             anyhow::bail!("No adblock domains");
         }
-        let mut bloom = Bloom::<str>::new_for_fp_rate(num, fp_rate)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut bloom =
+            Bloom::<str>::new_for_fp_rate(num, fp_rate).map_err(|e| anyhow::anyhow!("{}", e))?;
 
         let mut exact = HashSet::with_capacity(num);
         for domain in domains {

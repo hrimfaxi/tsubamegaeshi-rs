@@ -222,7 +222,7 @@ pub fn rewrite_dns_id(data: &mut [u8], id: u16) {
     }
 }
 
-pub fn debug_print_first_ip(resp: &[u8], tag: &str, domain: &str, upstream: &str) {
+pub fn debug_print_first_ip(resp: &[u8], tag: &str, domain: &str, upstream: &std::net::SocketAddr) {
     if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
     }
