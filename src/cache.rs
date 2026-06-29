@@ -78,7 +78,18 @@ impl DnsCache {
             return;
         };
 
-        let expire = Instant::now() + Duration::from_secs(effective_ttl);
+        self.put_with_ttl(domain, qtype_num, response, effective_ttl)
+            .await;
+    }
+
+    /// 直接以给定 TTL 写入缓存，跳过响应解析和校验。
+    /// 调用方必须确保 response 是 NoError 且 answers 非空。
+    pub async fn put_with_ttl(&self, domain: &str, qtype_num: u16, response: &[u8], ttl_secs: u64) {
+        if ttl_secs == 0 {
+            return;
+        }
+
+        let expire = Instant::now() + Duration::from_secs(ttl_secs);
 
         let mut cache = self.inner.lock().await;
         cache.put(

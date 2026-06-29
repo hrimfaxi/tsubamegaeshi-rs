@@ -18,7 +18,7 @@ use crate::adblock::AdblockChecker;
 use crate::cache::DnsCache;
 use crate::dns_utils::{
     AddressQueryKind, build_a_response, build_aaaa_response, build_nodata_response,
-    build_servfail_response, debug_print_first_ip,
+    build_servfail_response, debug_print_first_ip, response_cache_ttl,
 };
 use crate::domain_utils::{canonical_domain, domain_matches_suffix_canonical, is_forced_canonical};
 use crate::gfwlist::BloomDomainChecker;
@@ -384,13 +384,8 @@ impl DnsServer {
         debug_print_first_ip(&resp, tag, ctx.clean_domain, upstream);
 
         // 只有 NoError 的响应才缓存和打标
-        self.cache_and_mark_if_ok(
-            &resp,
-            ctx.clean_domain,
-            ctx.kind.cache_qtype(),
-            ctx.kind.cache_skip_tag(),
-        )
-        .await;
+        self.cache_and_mark_if_ok(&resp, ctx.clean_domain, ctx.kind.cache_qtype())
+            .await;
 
         let _ = self.socket.send_to(&resp, ctx.src).await;
     }
@@ -718,13 +713,8 @@ impl DnsServer {
 
         debug_print_first_ip(&final_resp, chosen_tag, ctx.clean_domain, chosen_upstream);
 
-        self.cache_and_mark_if_ok(
-            &final_resp,
-            ctx.clean_domain,
-            ctx.kind.cache_qtype(),
-            ctx.kind.cache_skip_tag(),
-        )
-        .await;
+        self.cache_and_mark_if_ok(&final_resp, ctx.clean_domain, ctx.kind.cache_qtype())
+            .await;
 
         let _ = self.socket.send_to(&final_resp, ctx.src).await;
 
@@ -1094,11 +1084,15 @@ impl DnsServer {
     }
 
     /// 如果响应成功，则写入缓存并执行 mark_sites
-    async fn cache_and_mark_if_ok(&self, resp: &[u8], domain: &str, qtype: u16, skip_tag: &str) {
+    async fn cache_and_mark_if_ok(&self, resp: &[u8], domain: &str, qtype: u16) {
         if let Ok(msg) = Message::from_vec(resp)
             && msg.response_code() == ResponseCode::NoError
         {
-            self.cache_response(domain, qtype, resp, skip_tag).await;
+            if let Some(cache) = &self.cache
+                && let Some(ttl) = response_cache_ttl(&msg)
+            {
+                cache.put_with_ttl(domain, qtype, resp, ttl).await;
+            }
             self.apply_mark_sites(resp, domain).await;
         }
     }
