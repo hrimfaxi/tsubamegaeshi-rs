@@ -214,16 +214,12 @@ impl DnsServer {
                 .collect::<Vec<_>>()
         );
 
-        let mut ips = HashSet::new();
-        if let Ok(all_ips) = extract_answer_ips(final_resp) {
-            for ip in all_ips {
-                ips.insert(ip);
-            }
-        }
+        let all_ips = match extract_answer_ips(final_resp) {
+            Ok(ips) if !ips.is_empty() => ips,
+            _ => return,
+        };
 
-        if ips.is_empty() {
-            return;
-        }
+        let ips: HashSet<IpAddr> = all_ips.into_iter().collect();
 
         let nft_manager = nft.clone();
         let tables: Vec<String> = matched_groups.iter().map(|g| g.nft_table.clone()).collect();
