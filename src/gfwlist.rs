@@ -1,5 +1,5 @@
 use crate::domain_utils::canonical_domain;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bloomfilter::Bloom;
@@ -26,7 +26,7 @@ impl GfwlistDecoder {
         let base64_str: String = raw_content.chars().filter(|c| !c.is_whitespace()).collect();
 
         if base64_str.is_empty() {
-            anyhow::bail!("文件内容为空");
+            bail!("文件内容为空");
         }
 
         let decoded_bytes = STANDARD
@@ -76,11 +76,11 @@ impl BloomDomainChecker {
         let num_items = domains.len();
 
         if num_items == 0 {
-            anyhow::bail!("没有提供任何域名，无法构建布隆过滤器");
+            bail!("没有提供任何域名，无法构建布隆过滤器");
         }
 
         let mut filter = Bloom::<str>::new_for_fp_rate(num_items, fp_rate)
-            .map_err(|e| anyhow::anyhow!("创建布隆过滤器失败: {}", e))?;
+            .map_err(|e| anyhow!("创建布隆过滤器失败: {}", e))?;
 
         for domain in domains {
             let domain = canonical_domain(domain);

@@ -9,7 +9,7 @@ mod pollution;
 mod server;
 mod task_guard;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use clap::Parser;
 use maxminddb::Reader;
 use std::collections::HashSet;
@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
 
         let (polluted_v4, polluted_v6) = rx
             .await
-            .map_err(|_| anyhow::anyhow!("pollution load channel closed"))?;
+            .map_err(|_| anyhow!("pollution load channel closed"))?;
 
         Some(PollutionChecker {
             v4: polluted_v4,

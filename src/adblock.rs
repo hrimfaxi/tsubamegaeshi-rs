@@ -1,5 +1,5 @@
 use crate::domain_utils::canonical_domain;
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use bloomfilter::Bloom;
 use std::collections::HashSet;
 use std::fs;
@@ -74,10 +74,10 @@ impl AdblockChecker {
     pub fn new(domains: &[String], fp_rate: f64) -> Result<Self> {
         let num = domains.len();
         if num == 0 {
-            anyhow::bail!("No adblock domains");
+            bail!("No adblock domains");
         }
         let mut bloom =
-            Bloom::<str>::new_for_fp_rate(num, fp_rate).map_err(|e| anyhow::anyhow!("{}", e))?;
+            Bloom::<str>::new_for_fp_rate(num, fp_rate).map_err(|e| anyhow!("{}", e))?;
 
         let mut exact = HashSet::with_capacity(num);
         for domain in domains {
