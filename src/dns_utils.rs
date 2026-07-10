@@ -127,36 +127,48 @@ pub fn build_nodata_response(query: &Message) -> Vec<u8> {
 }
 
 pub fn build_a_response(query: &Message, ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
+    build_a_multi_response(query, &[ip], ttl)
+}
+
+pub fn build_a_multi_response(query: &Message, ips: &[Ipv4Addr], ttl: u32) -> Vec<u8> {
     let mut resp = build_basic_response_message(query, ResponseCode::NoError);
 
     let Some(q) = query.queries().first() else {
         return build_servfail_response(query);
     };
 
-    let mut answer = Record::new();
-    answer.set_name(q.name().clone());
-    answer.set_record_type(RecordType::A);
-    answer.set_ttl(ttl);
-    answer.set_data(Some(RData::A(ARecord(ip))));
+    for ip in ips {
+        let mut answer = Record::new();
+        answer.set_name(q.name().clone());
+        answer.set_record_type(RecordType::A);
+        answer.set_ttl(ttl);
+        answer.set_data(Some(RData::A(ARecord(*ip))));
+        resp.add_answer(answer);
+    }
 
-    resp.add_answer(answer);
     resp.to_vec().unwrap_or_default()
 }
 
 pub fn build_aaaa_response(query: &Message, ip: Ipv6Addr, ttl: u32) -> Vec<u8> {
+    build_aaaa_multi_response(query, &[ip], ttl)
+}
+
+pub fn build_aaaa_multi_response(query: &Message, ips: &[Ipv6Addr], ttl: u32) -> Vec<u8> {
     let mut resp = build_basic_response_message(query, ResponseCode::NoError);
 
     let Some(q) = query.queries().first() else {
         return build_servfail_response(query);
     };
 
-    let mut answer = Record::new();
-    answer.set_name(q.name().clone());
-    answer.set_record_type(RecordType::AAAA);
-    answer.set_ttl(ttl);
-    answer.set_data(Some(RData::AAAA(AAAARecord(ip))));
+    for ip in ips {
+        let mut answer = Record::new();
+        answer.set_name(q.name().clone());
+        answer.set_record_type(RecordType::AAAA);
+        answer.set_ttl(ttl);
+        answer.set_data(Some(RData::AAAA(AAAARecord(*ip))));
+        resp.add_answer(answer);
+    }
 
-    resp.add_answer(answer);
     resp.to_vec().unwrap_or_default()
 }
 
@@ -289,6 +301,42 @@ mod tests {
         );
     }
 
+    // ========== build_a_multi_response ==========
+
+    #[test]
+    fn test_build_a_multi_response() {
+        let query = sample_query();
+        let ips = vec![
+            Ipv4Addr::new(1, 2, 3, 4),
+            Ipv4Addr::new(5, 6, 7, 8),
+            Ipv4Addr::new(9, 10, 11, 12),
+        ];
+        let bytes = build_a_multi_response(&query, &ips, 60);
+
+        let resp = Message::from_vec(&bytes).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert_eq!(resp.answers().len(), 3);
+
+        for (i, ans) in resp.answers().iter().enumerate() {
+            assert_eq!(ans.record_type(), RecordType::A);
+            assert_eq!(ans.ttl(), 60);
+            assert_eq!(
+                ans.data().unwrap().ip_addr(),
+                Some(std::net::IpAddr::V4(ips[i]))
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_a_multi_response_empty() {
+        let query = sample_query();
+        let bytes = build_a_multi_response(&query, &[], 60);
+
+        let resp = Message::from_vec(&bytes).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert!(resp.answers().is_empty());
+    }
+
     // ========== build_aaaa_response ==========
 
     #[test]
@@ -304,6 +352,27 @@ mod tests {
         let ans = &resp.answers()[0];
         assert_eq!(ans.record_type(), RecordType::AAAA);
         assert_eq!(ans.ttl(), 300);
+    }
+
+    // ========== build_aaaa_multi_response ==========
+
+    #[test]
+    fn test_build_aaaa_multi_response() {
+        let query = sample_query();
+        let ips = vec![
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+        ];
+        let bytes = build_aaaa_multi_response(&query, &ips, 120);
+
+        let resp = Message::from_vec(&bytes).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert_eq!(resp.answers().len(), 2);
+
+        for ans in resp.answers() {
+            assert_eq!(ans.record_type(), RecordType::AAAA);
+            assert_eq!(ans.ttl(), 120);
+        }
     }
 
     // ========== build_nodata_response ==========

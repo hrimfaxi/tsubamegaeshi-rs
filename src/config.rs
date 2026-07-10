@@ -1,14 +1,61 @@
 use anyhow::bail;
 use serde::Deserialize;
-use std::collections::HashMap;
+use serde::de::{self, Deserializer, Visitor};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+
+/// TOML 中接受单个字符串或字符串数组，统一归一化为 Vec。
+///
+/// **含 `.` 的域名 key 需加引号**，否则 TOML 会解析为嵌套表。
+///
+/// ```toml
+/// [hosts.ipv4]
+/// "example.com"       = "1.2.3.4"
+/// "multi.example.com" = ["1.2.3.4", "5.6.7.8"]
+/// localhost           = "127.0.0.1"  # 无点号可不加引号
+/// ```
+#[derive(Clone, Debug)]
+pub struct OneOrMany(pub Vec<String>);
+
+impl OneOrMany {
+    pub fn into_vec(self) -> Vec<String> {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for OneOrMany {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct OneOrManyVisitor;
+
+        impl<'de> Visitor<'de> for OneOrManyVisitor {
+            type Value = OneOrMany;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a string or an array of strings")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(OneOrMany(vec![v.to_owned()]))
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                let vec: Vec<String> =
+                    Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
+                Ok(OneOrMany(vec))
+            }
+        }
+
+        deserializer.deserialize_any(OneOrManyVisitor)
+    }
+}
 
 #[derive(Deserialize)]
 pub struct HostsTables {
     #[serde(default)]
-    pub ipv4: Option<HashMap<String, String>>,
+    pub ipv4: Option<HashMap<String, OneOrMany>>,
 
     #[serde(default)]
-    pub ipv6: Option<HashMap<String, String>>,
+    pub ipv6: Option<HashMap<String, OneOrMany>>,
 }
 
 #[derive(Deserialize)]
@@ -132,6 +179,30 @@ impl Config {
             && !(rate > 0.0 && rate < 1.0)
         {
             bail!("adblock_fp_rate must be greater than 0.0 and less than 1.0");
+        }
+
+        if let Some(hosts) = &self.hosts {
+            let check_hosts = |table: &HashMap<String, OneOrMany>,
+                               label: &str|
+             -> anyhow::Result<()> {
+                let mut seen = HashSet::new();
+                for (domain, entry) in table {
+                    if entry.0.is_empty() {
+                        bail!("{label}.{domain}: IP list cannot be empty");
+                    }
+                    let canonical = crate::domain_utils::canonical_domain(domain);
+                    if !seen.insert(canonical.clone()) {
+                        bail!("{label}: duplicate domain '{domain}' (canonical: '{canonical}')");
+                    }
+                }
+                Ok(())
+            };
+            if let Some(ipv4) = &hosts.ipv4 {
+                check_hosts(ipv4, "hosts.ipv4")?;
+            }
+            if let Some(ipv6) = &hosts.ipv6 {
+                check_hosts(ipv6, "hosts.ipv6")?;
+            }
         }
 
         Ok(())
@@ -273,6 +344,139 @@ mod tests {
         map.insert("abc123".to_string(), vec!["example.com".to_string()]);
         cfg.marksite = Some(map);
         assert!(cfg.validate().is_ok());
+    }
+
+    // ========== hosts ==========
+
+    #[test]
+    fn test_validate_hosts_empty_ipv4_list() {
+        let mut cfg = valid_config();
+        let mut ipv4 = HashMap::new();
+        ipv4.insert("empty.example.com".to_string(), OneOrMany(vec![]));
+        cfg.hosts = Some(HostsTables {
+            ipv4: Some(ipv4),
+            ipv6: None,
+        });
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_hosts_empty_ipv6_list() {
+        let mut cfg = valid_config();
+        let mut ipv6 = HashMap::new();
+        ipv6.insert("empty.example.com".to_string(), OneOrMany(vec![]));
+        cfg.hosts = Some(HostsTables {
+            ipv4: None,
+            ipv6: Some(ipv6),
+        });
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_hosts_non_empty_list_ok() {
+        let mut cfg = valid_config();
+        let mut ipv4 = HashMap::new();
+        ipv4.insert(
+            "ok.example.com".to_string(),
+            OneOrMany(vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()]),
+        );
+        cfg.hosts = Some(HostsTables {
+            ipv4: Some(ipv4),
+            ipv6: None,
+        });
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_hosts_canonical_collision() {
+        let mut cfg = valid_config();
+        let mut ipv4 = HashMap::new();
+        ipv4.insert(
+            "Example.COM".to_string(),
+            OneOrMany(vec!["1.1.1.1".to_string()]),
+        );
+        ipv4.insert(
+            "example.com.".to_string(),
+            OneOrMany(vec!["2.2.2.2".to_string()]),
+        );
+        cfg.hosts = Some(HostsTables {
+            ipv4: Some(ipv4),
+            ipv6: None,
+        });
+        assert!(cfg.validate().is_err());
+    }
+
+    // ========== TOML 反序列化 ==========
+
+    #[test]
+    fn test_toml_hosts_single_string() {
+        let toml_str = r#"
+            listen = "0.0.0.0:53"
+            special_suffixes = []
+            special_upstream = "127.0.0.1:53"
+            domestic_upstream = "127.0.0.1:53"
+            foreign_upstream = "127.0.0.1:53"
+            mmdb_path = "/dev/null"
+            cache_size = 100
+            enable_ipv6_aaaa = true
+            domestic_countries = ["CN"]
+
+            [hosts.ipv4]
+            "example.com" = "1.2.3.4"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let hosts = cfg.hosts.unwrap();
+        let ipv4 = hosts.ipv4.unwrap();
+        assert_eq!(
+            ipv4.get("example.com").unwrap().0,
+            vec!["1.2.3.4".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_toml_hosts_array() {
+        let toml_str = r#"
+            listen = "0.0.0.0:53"
+            special_suffixes = []
+            special_upstream = "127.0.0.1:53"
+            domestic_upstream = "127.0.0.1:53"
+            foreign_upstream = "127.0.0.1:53"
+            mmdb_path = "/dev/null"
+            cache_size = 100
+            enable_ipv6_aaaa = true
+            domestic_countries = ["CN"]
+
+            [hosts.ipv4]
+            "multi.example.com" = ["1.2.3.4", "5.6.7.8"]
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let hosts = cfg.hosts.unwrap();
+        let ipv4 = hosts.ipv4.unwrap();
+        assert_eq!(
+            ipv4.get("multi.example.com").unwrap().0,
+            vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_toml_hosts_canonical_collision_rejected() {
+        let toml_str = r#"
+            listen = "0.0.0.0:53"
+            special_suffixes = []
+            special_upstream = "127.0.0.1:53"
+            domestic_upstream = "127.0.0.1:53"
+            foreign_upstream = "127.0.0.1:53"
+            mmdb_path = "/dev/null"
+            cache_size = 100
+            enable_ipv6_aaaa = true
+            domestic_countries = ["CN"]
+
+            [hosts.ipv4]
+            "Example.COM" = "1.1.1.1"
+            "example.com." = "2.2.2.2"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     // ========== 合法基线 ==========

@@ -16,9 +16,11 @@ use tracing::{debug, error, trace, warn};
 
 use crate::adblock::AdblockChecker;
 use crate::cache::DnsCache;
+use crate::config::OneOrMany;
 use crate::dns_utils::{
-    AddressQueryKind, build_a_response, build_aaaa_response, build_nodata_response,
-    build_servfail_response, debug_print_first_ip, response_cache_ttl,
+    AddressQueryKind, build_a_multi_response, build_a_response, build_aaaa_multi_response,
+    build_aaaa_response, build_nodata_response, build_servfail_response, debug_print_first_ip,
+    response_cache_ttl,
 };
 use crate::domain_utils::{canonical_domain, domain_matches_suffix_canonical, is_forced_canonical};
 use crate::gfwlist::BloomDomainChecker;
@@ -59,8 +61,8 @@ pub struct DnsServer {
     pub gfw_checker: Option<BloomDomainChecker>,
     pub force_foreign: Option<Vec<String>>,
     pub force_domestic: Option<Vec<String>>,
-    pub hosts_v4: Option<HashMap<String, Ipv4Addr>>,
-    pub hosts_v6: Option<HashMap<String, Ipv6Addr>>,
+    pub hosts_v4: Option<HashMap<String, Vec<Ipv4Addr>>>,
+    pub hosts_v6: Option<HashMap<String, Vec<Ipv6Addr>>>,
     pub mark_sites: Option<MarkSites>,
     pub nft_manager: Option<Arc<CommandNftManager>>,
     pub adblock_checker: Option<Arc<AdblockChecker>>,
@@ -265,13 +267,16 @@ impl DnsServer {
 
     pub async fn handle_hosts_override(&self, ctx: &RequestContext<'_>) -> bool {
         // hosts 处理：
-        // - A：返回 hosts 里的 IPv4
-        // - AAAA：如果 hosts 里存在该域名但无对应类型，则返回 NODATA
+        // - A/AAAA：返回 hosts 里的 IP 列表（随机顺序，负载均衡）
+        // - HTTPS：返回 hosts 里的 IP 作为 hints
+        // - 若域名在 hosts 中但无对应类型，返回 NODATA
         match ctx.kind {
             AddressQueryKind::A => {
-                if let Some(ip) = self.hosts_v4.as_ref().and_then(|h| h.get(ctx.clean_domain)) {
-                    let resp = build_a_response(ctx.query_msg, *ip, 60);
-                    debug!("[HOSTS-A] {} -> {}", ctx.clean_domain, ip);
+                if let Some(ips) = self.hosts_v4.as_ref().and_then(|h| h.get(ctx.clean_domain)) {
+                    let mut shuffled = ips.clone();
+                    fastrand::shuffle(&mut shuffled);
+                    let resp = build_a_multi_response(ctx.query_msg, &shuffled, 60);
+                    debug!("[HOSTS-A] {} -> {:?}", ctx.clean_domain, shuffled);
                     let _ = self.socket.send_to(&resp, ctx.src).await;
                     return true;
                 }
@@ -291,9 +296,11 @@ impl DnsServer {
             }
 
             AddressQueryKind::Aaaa => {
-                if let Some(ip) = self.hosts_v6.as_ref().and_then(|h| h.get(ctx.clean_domain)) {
-                    let resp = build_aaaa_response(ctx.query_msg, *ip, 60);
-                    debug!("[HOSTS-AAAA] {} -> {}", ctx.clean_domain, ip);
+                if let Some(ips) = self.hosts_v6.as_ref().and_then(|h| h.get(ctx.clean_domain)) {
+                    let mut shuffled = ips.clone();
+                    fastrand::shuffle(&mut shuffled);
+                    let resp = build_aaaa_multi_response(ctx.query_msg, &shuffled, 60);
+                    debug!("[HOSTS-AAAA] {} -> {:?}", ctx.clean_domain, shuffled);
                     let _ = self.socket.send_to(&resp, ctx.src).await;
                     return true;
                 }
@@ -313,21 +320,26 @@ impl DnsServer {
             }
 
             AddressQueryKind::Https => {
-                let v4_hints: Vec<Ipv4Addr> = self
+                let mut v4_hints: Vec<Ipv4Addr> = self
                     .hosts_v4
                     .as_ref()
                     .and_then(|h| h.get(ctx.clean_domain))
                     .into_iter()
+                    .flatten()
                     .copied()
                     .collect();
 
-                let v6_hints: Vec<Ipv6Addr> = self
+                let mut v6_hints: Vec<Ipv6Addr> = self
                     .hosts_v6
                     .as_ref()
                     .and_then(|h| h.get(ctx.clean_domain))
                     .into_iter()
+                    .flatten()
                     .copied()
                     .collect();
+
+                fastrand::shuffle(&mut v4_hints);
+                fastrand::shuffle(&mut v6_hints);
 
                 if !v4_hints.is_empty() || !v6_hints.is_empty() {
                     debug!(
@@ -1155,16 +1167,24 @@ pub async fn bind_listen_socket(addr: SocketAddr) -> anyhow::Result<UdpSocket> {
     }
 }
 
-pub fn parse_hosts<A: FromStr<Err = std::net::AddrParseError>>(
-    map: &HashMap<String, String>,
-) -> HashMap<String, A> {
+pub fn parse_hosts<A: Clone + FromStr<Err = std::net::AddrParseError> + Eq + std::hash::Hash>(
+    map: &HashMap<String, OneOrMany>,
+) -> HashMap<String, Vec<A>> {
     map.iter()
         .map(|(k, v)| {
-            let addr = v
-                .parse::<A>()
-                .unwrap_or_else(|e| panic!("invalid IP for {k}: {e}"));
+            let mut seen = HashSet::new();
+            let addrs: Vec<A> = v
+                .clone()
+                .into_vec()
+                .into_iter()
+                .map(|s| {
+                    s.parse::<A>()
+                        .unwrap_or_else(|e| panic!("invalid IP for {k}: {e}"))
+                })
+                .filter(|addr| seen.insert(addr.clone()))
+                .collect();
 
-            (canonical_domain(k), addr)
+            (canonical_domain(k), addrs)
         })
         .collect()
 }
@@ -1178,34 +1198,92 @@ pub fn parse_upstream(s: &str, field_name: &str) -> anyhow::Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::OneOrMany;
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
     // ========== parse_hosts ==========
 
     #[test]
-    fn test_parse_hosts_ipv4() {
+    fn test_parse_hosts_ipv4_single() {
         let mut map = HashMap::new();
-        map.insert("Example.COM".to_string(), "1.2.3.4".to_string());
+        map.insert(
+            "Example.COM".to_string(),
+            OneOrMany(vec!["1.2.3.4".to_string()]),
+        );
         let result = parse_hosts::<Ipv4Addr>(&map);
-        assert_eq!(result.get("example.com"), Some(&Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(
+            result.get("example.com"),
+            Some(&vec![Ipv4Addr::new(1, 2, 3, 4)])
+        );
     }
 
     #[test]
-    fn test_parse_hosts_ipv6() {
+    fn test_parse_hosts_ipv4_multi() {
         let mut map = HashMap::new();
-        map.insert("Example.COM".to_string(), "::1".to_string());
+        map.insert(
+            "multi.example.com".to_string(),
+            OneOrMany(vec![
+                "1.2.3.4".to_string(),
+                "5.6.7.8".to_string(),
+                "9.10.11.12".to_string(),
+            ]),
+        );
+        let result = parse_hosts::<Ipv4Addr>(&map);
+        assert_eq!(
+            result.get("multi.example.com"),
+            Some(&vec![
+                Ipv4Addr::new(1, 2, 3, 4),
+                Ipv4Addr::new(5, 6, 7, 8),
+                Ipv4Addr::new(9, 10, 11, 12),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_hosts_ipv6_multi() {
+        let mut map = HashMap::new();
+        map.insert(
+            "dual.example.com".to_string(),
+            OneOrMany(vec!["::1".to_string(), "fe80::1".to_string()]),
+        );
         let result = parse_hosts::<Ipv6Addr>(&map);
         assert_eq!(
-            result.get("example.com"),
-            Some(&Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))
+            result.get("dual.example.com"),
+            Some(&vec![
+                Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1),
+                Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_hosts_dedup() {
+        let mut map = HashMap::new();
+        map.insert(
+            "dup.example.com".to_string(),
+            OneOrMany(vec![
+                "1.2.3.4".to_string(),
+                "5.6.7.8".to_string(),
+                "1.2.3.4".to_string(),
+            ]),
+        );
+        let result = parse_hosts::<Ipv4Addr>(&map);
+        let addrs = result.get("dup.example.com").unwrap();
+        // 去重后保持首次出现顺序
+        assert_eq!(
+            addrs,
+            &vec![Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8)]
         );
     }
 
     #[test]
     fn test_parse_hosts_key_normalization() {
         let mut map = HashMap::new();
-        map.insert(".Test.ORG.".to_string(), "1.2.3.4".to_string());
+        map.insert(
+            ".Test.ORG.".to_string(),
+            OneOrMany(vec!["1.2.3.4".to_string()]),
+        );
         let result = parse_hosts::<Ipv4Addr>(&map);
         assert!(result.contains_key("test.org"));
         assert!(!result.contains_key(".Test.ORG."));
@@ -1215,8 +1293,11 @@ mod tests {
     #[should_panic(expected = "invalid IP for bad.example.com")]
     fn test_parse_hosts_invalid_ip_panics() {
         let mut map = HashMap::new();
-        map.insert("bad.example.com".to_string(), "not-an-ip".to_string());
-        let _: HashMap<String, Ipv4Addr> = parse_hosts(&map);
+        map.insert(
+            "bad.example.com".to_string(),
+            OneOrMany(vec!["not-an-ip".to_string()]),
+        );
+        let _: HashMap<String, Vec<Ipv4Addr>> = parse_hosts(&map);
     }
 
     // ========== parse_upstream ==========
