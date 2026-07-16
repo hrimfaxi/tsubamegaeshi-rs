@@ -69,10 +69,6 @@ start_service() {
   procd_close_instance
 }
 
-stop_service() {
-  procd_kill tsubamegaeshi-rs
-}
-
 reload_service() {
   echo "[*] restarting service (reload not supported)"
   restart
