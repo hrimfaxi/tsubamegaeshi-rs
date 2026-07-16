@@ -38,6 +38,10 @@ struct Cli {
     /// 配置文件路径
     #[arg(short = 'c', long, default_value = "config.toml")]
     config: String,
+
+    /// 只检查配置合法性，然后退出（返回 0 表示合法）
+    #[arg(short = 'T', long = "check")]
+    check: bool,
 }
 
 #[tokio::main]
@@ -51,6 +55,14 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = toml::from_str(&config_str).context("Invalid config.toml")?;
 
     config.validate()?;
+
+    if cli.check {
+        print!(
+            "{}",
+            toml::to_string_pretty(&config).expect("failed to serialize config")
+        );
+        return Ok(());
+    }
 
     let task_guard = Arc::new(TaskGuard::new());
 

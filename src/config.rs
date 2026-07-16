@@ -1,6 +1,6 @@
 use anyhow::bail;
-use serde::Deserialize;
 use serde::de::{self, Deserializer, Visitor};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -14,7 +14,7 @@ use std::fmt;
 /// "multi.example.com" = ["1.2.3.4", "5.6.7.8"]
 /// localhost           = "127.0.0.1"  # 无点号可不加引号
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct OneOrMany(pub Vec<String>);
 
 impl OneOrMany {
@@ -49,7 +49,7 @@ impl<'de> Deserialize<'de> for OneOrMany {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct HostsTables {
     #[serde(default)]
     pub ipv4: Option<HashMap<String, OneOrMany>>,
@@ -58,7 +58,7 @@ pub struct HostsTables {
     pub ipv6: Option<HashMap<String, OneOrMany>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct Config {
     pub listen: String,
     pub special_suffixes: Vec<String>,
