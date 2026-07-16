@@ -33,6 +33,11 @@ start_service() {
     return 1
   }
 
+  "$BIN" -T -c "$CONFIG_FILE" >/dev/null || {
+    echo "[x] config validation failed"
+    return 1
+  }
+
   procd_open_instance
 
   if [ -x /sbin/ujail ] && [ -e /etc/capabilities/tsubamegaeshi-rs.json ]; then
@@ -72,3 +77,5 @@ reload_service() {
   echo "[*] restarting service (reload not supported)"
   restart
 }
+
+# vim: set sw=2 ts=2 et:
