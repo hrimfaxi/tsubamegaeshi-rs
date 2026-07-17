@@ -3,7 +3,7 @@ name = "tsubamegaeshi-rs"
 version = "0.1.0"
 edition = "2024"
 description = "燕返 — Lightweight dual-rail DNS splitter with IP-based geo decisions, caching, and Xray integration"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

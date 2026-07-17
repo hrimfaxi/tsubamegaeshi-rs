@@ -4,12 +4,12 @@
 
 *佐々木小次郎の秘剣——一撃必殺。*
 
-**轻量级 DNS 分流工具 · 专为 OpenWrt 设计 · Rust 实现 · 二进制约 600KB**
+**轻量级 DNS 分流工具 · 专为 OpenWrt 设计 · Rust 实现 · 二进制约 700KB**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/Platform-OpenWrt-blue)
 ![Language](https://img.shields.io/badge/Language-Rust-orange)
-![Binary](https://img.shields.io/badge/Binary-~600KB-blueviolet)
+![Binary](https://img.shields.io/badge/Binary-~700KB-blueviolet)
 
 [快速上手](#-快速上手) · [工作流程](#-工作流程) · [功能概览](#-功能概览) · [配置参考](#-配置参考) · [命令行](#-命令行) · [编译](#-编译)
 
@@ -479,7 +479,7 @@ cargo build --release
 # 压缩
 upx --lzma target/release/tsubamegaeshi-rs
 
-# 结果约 600KB
+# 结果约 700KB
 ```
 
 Cargo.toml 中已包含 release profile（`opt-level = "z"`、LTO、strip、`panic = "abort"`），无需额外配置。
@@ -518,4 +518,4 @@ Cargo.toml 中已包含 release profile（`opt-level = "z"`、LTO、strip、`pan
 
 ## 📄 许可
 
-MIT
+[GPLv3](LICENSE)
