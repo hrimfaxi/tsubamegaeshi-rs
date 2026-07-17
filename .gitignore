@@ -1,1 +1,10 @@
 target
+.mimocode/
+*.tar.gz
+*.mmdb
+decode.txt
+to_llm.sh
+fuck_gfw_ipv6_injector.sh
+gfwlist.txt
+new_ipv6.txt
+testme
