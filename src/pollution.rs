@@ -211,8 +211,8 @@ fn parse_https_rr_hints(buf: &[u8], svcparams_start: usize, rdlen: usize) -> Res
                 if !len.is_multiple_of(4) {
                     bail!("invalid ipv4hint length {}", len);
                 }
-                for chunk in buf[value_start..value_start + len].chunks_exact(4) {
-                    let addr = Ipv4Addr::from(<[u8; 4]>::try_from(chunk)?);
+                for chunk in buf[value_start..value_start + len].as_chunks::<4>().0 {
+                    let addr = Ipv4Addr::from(*chunk);
                     ips.push(IpAddr::V4(addr));
                 }
             }
@@ -220,8 +220,8 @@ fn parse_https_rr_hints(buf: &[u8], svcparams_start: usize, rdlen: usize) -> Res
                 if !len.is_multiple_of(16) {
                     bail!("invalid ipv6hint length {}", len);
                 }
-                for chunk in buf[value_start..value_start + len].chunks_exact(16) {
-                    let addr = Ipv6Addr::from(<[u8; 16]>::try_from(chunk)?);
+                for chunk in buf[value_start..value_start + len].as_chunks::<16>().0 {
+                    let addr = Ipv6Addr::from(*chunk);
                     ips.push(IpAddr::V6(addr));
                 }
             }
