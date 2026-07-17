@@ -502,6 +502,8 @@ ads    = ["doubleclick.net", "googlesyndication.com"]
 
 ## 🔨 编译
 
+### 本地编译
+
 ```bash
 # 体积优化的 release 构建
 cargo build --release
@@ -513,6 +515,10 @@ upx --lzma target/release/tsubamegaeshi-rs
 ```
 
 Cargo.toml 中已包含 release profile（`opt-level = "z"`、LTO、strip、`panic = "abort"`），无需额外配置。
+
+### OpenWrt 编译
+
+OpenWrt package feed 及 Makefile 见 [openwrt-tsubamegaeshi-rs](https://github.com/hrimfaxi/openwrt-tsubamegaeshi-rs)，内含编译和安装说明。
 
 ---
 
