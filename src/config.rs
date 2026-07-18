@@ -61,8 +61,10 @@ pub struct HostsTables {
 #[derive(Deserialize, Serialize)]
 pub struct Config {
     pub listen: String,
-    pub special_suffixes: Vec<String>,
-    pub special_upstream: String,
+    #[serde(default)]
+    pub special_suffixes: Option<Vec<String>>,
+    #[serde(default)]
+    pub special_upstream: Option<String>,
     pub domestic_upstream: String,
     pub foreign_upstream: String,
     pub mmdb_path: String,
@@ -218,8 +220,8 @@ mod tests {
     fn valid_config() -> Config {
         Config {
             listen: "0.0.0.0:53".to_string(),
-            special_suffixes: vec![],
-            special_upstream: "127.0.0.1:53".to_string(),
+            special_suffixes: None,
+            special_upstream: None,
             domestic_upstream: "127.0.0.1:53".to_string(),
             foreign_upstream: "127.0.0.1:53".to_string(),
             mmdb_path: "/dev/null".to_string(),
@@ -412,8 +414,6 @@ mod tests {
     fn test_toml_hosts_single_string() {
         let toml_str = r#"
             listen = "0.0.0.0:53"
-            special_suffixes = []
-            special_upstream = "127.0.0.1:53"
             domestic_upstream = "127.0.0.1:53"
             foreign_upstream = "127.0.0.1:53"
             mmdb_path = "/dev/null"
@@ -437,8 +437,6 @@ mod tests {
     fn test_toml_hosts_array() {
         let toml_str = r#"
             listen = "0.0.0.0:53"
-            special_suffixes = []
-            special_upstream = "127.0.0.1:53"
             domestic_upstream = "127.0.0.1:53"
             foreign_upstream = "127.0.0.1:53"
             mmdb_path = "/dev/null"
@@ -462,8 +460,6 @@ mod tests {
     fn test_toml_hosts_canonical_collision_rejected() {
         let toml_str = r#"
             listen = "0.0.0.0:53"
-            special_suffixes = []
-            special_upstream = "127.0.0.1:53"
             domestic_upstream = "127.0.0.1:53"
             foreign_upstream = "127.0.0.1:53"
             mmdb_path = "/dev/null"

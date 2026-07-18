@@ -182,7 +182,11 @@ async fn main() -> anyhow::Result<()> {
 
     let socket = bind_listen_socket(addr).await?;
 
-    let special_upstream = parse_upstream(&config.special_upstream, "special_upstream")?;
+    let special_upstream = config
+        .special_upstream
+        .as_deref()
+        .map(|s| parse_upstream(s, "special_upstream"))
+        .transpose()?;
     let domestic_upstream = parse_upstream(&config.domestic_upstream, "domestic_upstream")?;
     let foreign_upstream = parse_upstream(&config.foreign_upstream, "foreign_upstream")?;
     let cache = NonZeroUsize::new(config.cache_size).map(DnsCache::new);
@@ -193,12 +197,12 @@ async fn main() -> anyhow::Result<()> {
         (v4, v6)
     });
 
-    let special_suffixes: Vec<String> = config
-        .special_suffixes
-        .iter()
-        .map(|s| canonical_domain(s))
-        .filter(|s| !s.is_empty())
-        .collect();
+    let special_suffixes: Option<Vec<String>> = config.special_suffixes.map(|v| {
+        v.iter()
+            .map(|s| canonical_domain(s))
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
 
     let force_foreign = normalize_domain_list(config.force_foreign_domains);
     let force_domestic = normalize_domain_list(config.force_domestic_domains);

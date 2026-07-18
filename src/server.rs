@@ -50,11 +50,11 @@ pub struct RequestContext<'a> {
 
 pub struct DnsServer {
     pub socket: UdpSocket,
-    pub special_upstream: SocketAddr,
+    pub special_upstream: Option<SocketAddr>,
     pub domestic_upstream: SocketAddr,
     pub foreign_upstream: SocketAddr,
     pub mmdb: Reader<Vec<u8>>,
-    pub special_suffixes: Vec<String>,
+    pub special_suffixes: Option<Vec<String>>,
     pub cache: Option<DnsCache>,
     pub timeout: Duration,
     pub enable_ipv6_aaaa: bool,
@@ -416,19 +416,20 @@ impl DnsServer {
     }
 
     pub async fn forward_by_static_rules(&self, ctx: &RequestContext<'_>) -> bool {
-        for suffix in &self.special_suffixes {
-            if domain_matches_suffix_canonical(ctx.clean_domain, suffix) {
-                debug!(
-                    "[{}] {} -> dnsmasq",
-                    ctx.kind.special_tag(),
-                    ctx.clean_domain
-                );
+        if let (Some(suffixes), Some(upstream)) = (&self.special_suffixes, &self.special_upstream) {
+            for suffix in suffixes {
+                if domain_matches_suffix_canonical(ctx.clean_domain, suffix) {
+                    debug!(
+                        "[{}] {} -> dnsmasq",
+                        ctx.kind.special_tag(),
+                        ctx.clean_domain
+                    );
 
-                let upstream = self.special_upstream;
-                self.forward_and_cache(ctx, &upstream, ctx.kind.special_tag())
-                    .await;
+                    self.forward_and_cache(ctx, upstream, ctx.kind.special_tag())
+                        .await;
 
-                return true;
+                    return true;
+                }
             }
         }
 

@@ -1,8 +1,9 @@
 listen = "[::]:5353"
-special_suffixes = [".h", ".local", ".lan", ".home", ]
 
-# openwrt dnsmasq 地址
-special_upstream = "127.0.0.1:5353"
+# 将特定后缀域名转发给指定上游（可选，不写则不启用）
+# 注意：special_upstream 不能与 listen 端口相同，也不能指向会转发回自己的上游，否则会循环
+# special_suffixes = [".h", ".local", ".lan", ".home"]
+# special_upstream = "127.0.0.1:5354"
 
 # 国内dns地址
 domestic_upstream = "223.5.5.5"
