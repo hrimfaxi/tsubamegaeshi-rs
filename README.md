@@ -95,18 +95,6 @@ enable_ipv6_aaaa    = false
 
 ### 5️⃣ OpenWrt 部署
 
-有两种模式可选，根据你的需求决定：
-
-| | 简单模式（推荐） | 专业模式 |
-|---|---|---|
-| 燕返端口 | 5353 | 53 |
-| dnsmasq 端口 | 53（不变） | 5353 |
-| 配置方式 | init 脚本自动管理 | 手动改 4 个配置文件 |
-| DHCP option 6 | 不需要 | 需要手动配置 |
-| 适用场景 | 普通用户，即装即用 | 需要燕返完全控制 53 端口（如配合 xray/xtp-rs tproxy） |
-
-#### 简单模式（燕返 :5353 / dnsmasq :53）
-
 init 脚本自动将 dnsmasq 上游指向燕返，dnsmasq 继续占用 53 端口服务 DHCP 和本地域名：
 
 ```mermaid
@@ -134,75 +122,11 @@ uci set tsubamegaeshi-rs.service.dns_hijack=1
 
 > **注意**：`dns_hijack` 依赖 nftables（OpenWrt 23.05+ 的 fw4），旧版防火墙不支持。
 
-#### 专业模式（燕返 :53 / dnsmasq :5353）
-
-燕返直接接管 53 端口，dnsmasq 退到 5353。需要手动配置，但燕返对 53 端口有完全控制权。适合需要配合 xray / xtp-rs tproxy 的场景——tproxy 伪装 DNS 回包时需要 `bind 远端IP:53`（如 `8.8.8.8:53`），而 dnsmasq 默认 `bind 0.0.0.0:53` 且不带 `SO_REUSEPORT`，会抢占所有 IP 的 53 端口导致 tproxy 绑定失败。把 dnsmasq 移走后燕返独占 53，不再有冲突。
-
-```mermaid
-flowchart LR
-    CL["客户端<br/>（DHCP option 6：DNS = 路由器地址）"] --> TS["燕返 :53"]
-    TS -->|".lan / .home 等本地后缀"| DM["dnsmasq :5353<br/>本地域名 · DHCP"]
-    TS -->|"国内域名"| CN["国内上游 223.5.5.5"]
-    TS -->|"其他 / 被墙域名"| FW["国外上游 8.8.8.8（污染检测）"]
-```
-
-**① dnsmasq 改到 5353 端口** —— `/etc/config/dhcp`：
-
-```
-config dnsmasq
-    option port '5353'
-```
-
-**② br-lan 接口不要设置 DNS 服务器**
-
-`/etc/config/network` 中 lan（br-lan）接口保持不设 `option dns`（LuCI：网络 → 接口 → LAN → 高级设置，「使用自定义的 DNS 服务器」留空）。接口上设置的 DNS 会被写入 `/tmp/resolv.conf.auto`，成为 dnsmasq 的上游，导致查询绕过燕返。
-
-**③ 所有 wan / wan6 接口：改用指定 DNS 服务器，且指定值留空** —— `/etc/config/network`：
-
-```
-config interface 'wan'
-    option peerdns '0'
-    # 不要配置 option dns，保持为空
-
-config interface 'wan6'
-    option peerdns '0'
-```
-
-对应 LuCI：网络 → 接口 → wan / wan6 → 高级设置，取消勾选「使用对端通告的 DNS 服务器」，同时「自定义 DNS 服务器」不要填任何值。这样 `/tmp/resolv.conf.auto` 里不会混入运营商 DHCP 下发的 DNS，dnsmasq 拿不到任何公网上游，公网域名只能经燕返处理。
-
-**④ DHCP 附加选项手动下发 DNS 服务器**
-
-dnsmasq 改到 5353 后，不再通过 DHCP 向客户端通报 DNS 服务器（客户端会拿不到 DNS，表现为"网通了但无法解析"）。需要手动加一条 DHCP option 6，把客户端的 DNS 指到路由器 LAN 地址——也就是燕返监听的 53 端口。`/etc/config/dhcp`：
-
-```
-config dhcp 'lan'
-    list dhcp_option '6,192.168.1.1'   # 换成你的路由器 LAN 地址
-```
-
-对应 LuCI：网络 → 接口 → LAN → DHCP 服务器 → 高级设置 → 「DHCP 选项」添加 `6,192.168.1.1`。
-
-同时修改 `config.toml`：
-
-```toml
-listen = "0.0.0.0:53"                 # 燕返直接占用 53
-special_upstream = "127.0.0.1:5353"   # dnsmasq 退到 5353
-```
-
-改完后重启网络服务并启动燕返：
-
-```bash
-/etc/init.d/network restart
-/etc/init.d/dnsmasq restart
-./tsubamegaeshi-rs -c /etc/tsubamegaeshi-rs/config.toml
-```
-
 ### 6️⃣ 验证
 
 ```bash
-# 本地域名
-dig @127.0.0.1 nas.lan            # 简单模式（通过 dnsmasq）
-dig @127.0.0.1 -p 53 nas.lan      # 同上
-dig @127.0.0.1 -p 5353 nas.lan    # 专业模式（直接燕返）
+# 本地域名（通过 dnsmasq 转发）
+dig @127.0.0.1 nas.lan
 
 # 国内域名：应返回国内 IP（日志出现 [DOMESTIC-KEEP]）
 dig @127.0.0.1 www.taobao.com
@@ -226,7 +150,7 @@ dig @127.0.0.1 www.taobao.com
 | 启动 panic 提到 hosts | hosts 里写错了 IP；`-T` 只校验结构，不校验 IP 语法，以实际启动为准 |
 | 日志刷屏 | `log_level` 缺省为 `info,tsubamegaeshi_rs=debug`，稳定运行后显式设为 `"info"` |
 | marksite 不生效 | 需要系统装有 `/usr/sbin/nft` 且有执行权限；未配置 `[marksite]` 则完全不触碰 nftables |
-| OpenWrt 上“网通了但客户端无法解析” | **简单模式**：init 脚本未正确修改 dnsmasq 配置（检查 `/etc/config/dhcp` 中是否有 `server=127.0.0.1#5353`），或 dnsmasq 未 reload。**专业模式**：漏配 DHCP option 6（客户端没拿到 DNS），或某 wan 口没关 peerdns 导致混入运营商上游 |
+| OpenWrt 上"网通了但客户端无法解析" | init 脚本未正确修改 dnsmasq 配置（检查 `/etc/config/dhcp` 中是否有 `server=127.0.0.1#5353`），或 dnsmasq 未 reload |
 
 ---
 
