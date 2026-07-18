@@ -1,4 +1,4 @@
-listen = "[::]:53"
+listen = "[::]:5353"
 special_suffixes = [".h", ".local", ".lan", ".home", ]
 
 # openwrt dnsmasq 地址

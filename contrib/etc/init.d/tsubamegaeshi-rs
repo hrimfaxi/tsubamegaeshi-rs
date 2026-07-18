@@ -1,10 +1,12 @@
 #!/bin/sh /etc/rc.common
 
 USE_PROCD=1
-START=50
+START=75
 STOP=15
 
 BIN="/usr/bin/tsubamegaeshi-rs"
+LOCK_FILE="/etc/tsubamegaeshi-rs/dnsmasq.lock"
+LISTEN_PORT=5353
 
 load_config() {
   config_load tsubamegaeshi-rs
@@ -13,6 +15,48 @@ load_config() {
   config_get CONFIG_FILE main config "/etc/tsubamegaeshi-rs/config.toml"
   config_get RUN_USER main user nobody
   config_get NOFILE main nofile 1024768
+  config_get DNS_HIJACK main dns_hijack "0"
+}
+
+takeover_dns() {
+  # 保存原始值（只存一次，防止重复 start 覆盖）
+  [ ! -f "$LOCK_FILE" ] && {
+    printf "noresolv=%s\n" "$(uci -q get dhcp.@dnsmasq[0].noresolv)"
+    printf "cachesize=%s\n" "$(uci -q get dhcp.@dnsmasq[0].cachesize)"
+  } > "$LOCK_FILE"
+
+  sed -i "/list server/d" /etc/config/dhcp
+  uci add_list dhcp.@dnsmasq[0].server="127.0.0.1#$LISTEN_PORT"
+  uci set dhcp.@dnsmasq[0].noresolv="1"
+  uci set dhcp.@dnsmasq[0].cachesize="0"
+  uci commit dhcp
+  /etc/init.d/dnsmasq reload
+}
+
+restore_dns() {
+  [ -f "$LOCK_FILE" ] || return 0
+
+  sed -i "/list server/d" /etc/config/dhcp
+
+  . "$LOCK_FILE"
+
+  [ -n "$noresolv" ] && uci set dhcp.@dnsmasq[0].noresolv="$noresolv" \
+                     || uci del dhcp.@dnsmasq[0].noresolv
+  [ -n "$cachesize" ] && uci set dhcp.@dnsmasq[0].cachesize="$cachesize" \
+                     || uci del dhcp.@dnsmasq[0].cachesize
+
+  uci commit dhcp
+  /etc/init.d/dnsmasq reload
+  rm -f "$LOCK_FILE"
+}
+
+setup_nft_hijack() {
+  nft delete table inet tsubame 2>/dev/null
+  nft add table inet tsubame
+  nft add chain inet tsubame prerouting \
+    "{ type nat hook prerouting priority -95; policy accept; }"
+  nft add rule inet tsubame prerouting \
+    "meta nfproto { ipv4, ipv6 } udp dport 53 counter redirect to :$LISTEN_PORT"
 }
 
 start_service() {
@@ -67,6 +111,18 @@ start_service() {
   procd_set_param file "$CONFIG_FILE"
 
   procd_close_instance
+
+  takeover_dns
+
+  # 可选：劫持局域网里绕过 dnsmasq 的设备
+  if [ "$DNS_HIJACK" -eq 1 ] && [ -x /sbin/fw4 ]; then
+    setup_nft_hijack
+  fi
+}
+
+stop_service() {
+  restore_dns
+  nft delete table inet tsubame 2>/dev/null
 }
 
 reload_service() {
