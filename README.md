@@ -2,9 +2,9 @@
 
 # 燕返 (Tsubame Gaeshi)
 
-*佐々木小次郎の秘剣——一撃必殺。*
+**国内域名走国内 DNS，被墙域名走国外 DNS——结合 GeoIP 与 GFWList 自动分流。**
 
-**轻量级 DNS 分流工具 · 专为 OpenWrt 设计 · Rust 实现 · 二进制约 700KB**
+专为 OpenWrt 路由器设计的轻量级 DNS 分流工具。Rust 实现，单二进制 ~700KB，无 C 依赖，flash 空间紧张的小路由也能轻松放下。
 
 [![License: GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/Platform-OpenWrt-blue)
@@ -37,7 +37,18 @@
 | `adblock.txt` | ➖ | AdBlock Plus 格式的广告域名规则 |
 | `ipv4.txt` / `ipv6.txt` | ➖ | 自定义污染 IP 列表（`max_polluted_packets` 大于 0 时才加载） |
 
-建议统一放在 `/etc/tsubamegaeshi-rs/` 下。
+建议统一放在 `/etc/tsubamegaeshi-rs/` 下。这些规则文件需要定期更新，可通过以下命令一键更新：
+
+```bash
+/usr/libexec/update_tsubamegaeshi_files.sh
+```
+
+OpenWrt 上可添加 crontab 定期执行（如每周日凌晨 3 点）：
+
+```bash
+echo '0 3 * * 0 /usr/libexec/update_tsubamegaeshi_files.sh' >> /etc/crontabs/root
+/etc/init.d/cron restart
+```
 
 ### 2️⃣ 最小配置
 
