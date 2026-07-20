@@ -1,0 +1,36 @@
+#!/bin/sh
+# Tsubamegaeshi-rs uci-defaults - first install initialization
+
+# Set default values if not already configured
+uci -q get tsubamegaeshi-rs.config > /dev/null 2>&1 || {
+	uci batch <<'EOF'
+set tsubamegaeshi-rs.config=tsubamegaeshi-rs
+set tsubamegaeshi-rs.config.enabled='0'
+set tsubamegaeshi-rs.config.listen_port='5336'
+set tsubamegaeshi-rs.config.listen_address='127.0.0.1'
+set tsubamegaeshi-rs.config.log_level='info'
+set tsubamegaeshi-rs.config.domestic_dns='223.5.5.5'
+set tsubamegaeshi-rs.config.foreign_dns='8.8.8.8'
+set tsubamegaeshi-rs.config.query_timeout_sec='10'
+set tsubamegaeshi-rs.config.mmdb_path='/etc/tsubamegaeshi-rs/Country-only-cn-private.mmdb'
+set tsubamegaeshi-rs.config.domestic_countries='CN'
+set tsubamegaeshi-rs.config.gfwlist='1'
+set tsubamegaeshi-rs.config.gfwlist_path='/etc/tsubamegaeshi-rs/gfwlist.txt'
+set tsubamegaeshi-rs.config.gfbloom_fp_rate='0.001'
+set tsubamegaeshi-rs.config.adblock='0'
+set tsubamegaeshi-rs.config.adblock_path='/etc/tsubamegaeshi-rs/adblockdomainlite.txt'
+set tsubamegaeshi-rs.config.adblock_fp_rate='0.001'
+set tsubamegaeshi-rs.config.cache_size='4096'
+set tsubamegaeshi-rs.config.ipv4_list='/etc/tsubamegaeshi-rs/ipv4.txt'
+set tsubamegaeshi-rs.config.ipv6_list='/etc/tsubamegaeshi-rs/ipv6.txt'
+set tsubamegaeshi-rs.config.max_polluted_packets='5'
+set tsubamegaeshi-rs.config.trust_domestic_nodata_reply='0'
+set tsubamegaeshi-rs.config.redirect='1'
+set tsubamegaeshi-rs.config.disable_ipv6='0'
+set tsubamegaeshi-rs.config.max_in_flight='128'
+
+EOF
+	uci commit tsubamegaeshi-rs
+}
+
+exit 0

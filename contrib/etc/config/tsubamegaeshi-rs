@@ -1,6 +1,55 @@
-config main 'service'
-    option enabled '1'
-    option config '/etc/tsubamegaeshi-rs/config.toml'
-    option user 'nobody'
-    option nofile '1024768'
-    option dns_hijack '0'
+config tsubamegaeshi-rs 'config'
+	option enabled '0'
+	option listen_port '5336'
+	option listen_address '127.0.0.1'
+	option log_level 'info'
+
+	# DNS upstream servers
+	option domestic_dns '223.5.5.5'
+	option foreign_dns '8.8.8.8'
+	option query_timeout_sec '10'
+
+	# Special suffix
+	option special_upstream ''
+
+	# GeoIP
+	option mmdb_path '/etc/tsubamegaeshi-rs/Country-only-cn-private.mmdb'
+	list domestic_countries 'CN'
+
+	# GFWList
+	option gfwlist '1'
+	option gfwlist_path '/etc/tsubamegaeshi-rs/gfwlist.txt'
+	option gfbloom_fp_rate '0.001'
+
+	# AdBlock
+	option adblock '0'
+	option adblock_path '/etc/tsubamegaeshi-rs/adblockdomainlite.txt'
+	option adblock_fp_rate '0.001'
+
+	# Domain rules
+
+	# Cache
+	option cache_size '4096'
+
+	# Pollution detection
+	option ipv4_list '/etc/tsubamegaeshi-rs/ipv4.txt'
+	option ipv6_list '/etc/tsubamegaeshi-rs/ipv6.txt'
+	option max_polluted_packets '5'
+	option trust_domestic_nodata_reply '0'
+
+	# Advanced
+	option redirect '1'
+	option disable_ipv6 '0'
+	option max_in_flight '128'
+
+
+
+# Hosts IPv4 Override - uncomment and add entries as needed
+# config hosts_ipv4 'example'
+#	option domain 'example.com'
+#	option ips '1.2.3.4'
+
+# Hosts IPv6 Override - uncomment and add entries as needed
+# config hosts_ipv6 'example_v6'
+#	option domain 'example.com'
+#	option ips '2001:db8::1'
