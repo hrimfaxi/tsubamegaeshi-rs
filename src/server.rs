@@ -91,6 +91,7 @@ impl DnsServer {
         query: &Message,
         upstream: &SocketAddr,
         timeout: Duration,
+        domain: &str,
     ) -> Vec<u8> {
         let checker = match self.pollution_checker.as_ref() {
             Some(c) if c.max_packets > 0 => c,
@@ -188,7 +189,10 @@ impl DnsServer {
                     return build_servfail_response(query);
                 }
                 Err(_) => {
-                    warn!("timeout after {} packets, returning SERVFAIL", recv_count);
+                    warn!(
+                        "[FOREIGN-TIMEOUT] {} -> {} timeout after {} packets ({:?})",
+                        domain, upstream, recv_count, timeout
+                    );
                     return build_servfail_response(query);
                 }
             }
@@ -265,7 +269,7 @@ impl DnsServer {
         });
     }
 
-    pub async fn handle_hosts_override(&self, ctx: &RequestContext<'_>) -> bool {
+    pub async fn handle_hosts_override(&self, ctx: &RequestContext<'_>) -> Option<Vec<u8>> {
         // hosts 处理：
         // - A/AAAA：返回 hosts 里的 IP 列表（随机顺序，负载均衡）
         // - HTTPS：返回 hosts 里的 IP 作为 hints
@@ -278,7 +282,7 @@ impl DnsServer {
                     let resp = build_a_multi_response(ctx.query_msg, &shuffled, 60);
                     debug!("[HOSTS-A] {} -> {:?}", ctx.clean_domain, shuffled);
                     let _ = self.socket.send_to(&resp, ctx.src).await;
-                    return true;
+                    return Some(resp);
                 }
 
                 if self
@@ -289,10 +293,10 @@ impl DnsServer {
                     debug!("[HOSTS-NO-A] {} (v6 only)", ctx.clean_domain);
                     let nodata = build_nodata_response(ctx.query_msg);
                     let _ = self.socket.send_to(&nodata, ctx.src).await;
-                    return true;
+                    return Some(nodata);
                 }
 
-                false
+                None
             }
 
             AddressQueryKind::Aaaa => {
@@ -302,7 +306,7 @@ impl DnsServer {
                     let resp = build_aaaa_multi_response(ctx.query_msg, &shuffled, 60);
                     debug!("[HOSTS-AAAA] {} -> {:?}", ctx.clean_domain, shuffled);
                     let _ = self.socket.send_to(&resp, ctx.src).await;
-                    return true;
+                    return Some(resp);
                 }
 
                 if self
@@ -313,10 +317,10 @@ impl DnsServer {
                     debug!("[HOSTS-NO-AAAA] {} (v4 only)", ctx.clean_domain);
                     let nodata = build_nodata_response(ctx.query_msg);
                     let _ = self.socket.send_to(&nodata, ctx.src).await;
-                    return true;
+                    return Some(nodata);
                 }
 
-                false
+                None
             }
 
             AddressQueryKind::Https => {
@@ -353,9 +357,9 @@ impl DnsServer {
                         60,
                     );
                     let _ = self.socket.send_to(&resp, ctx.src).await;
-                    return true;
+                    return Some(resp);
                 }
-                false
+                None
             }
         }
     }
@@ -381,7 +385,7 @@ impl DnsServer {
         ctx: &RequestContext<'_>,
         upstream: &SocketAddr,
         tag: &str,
-    ) {
+    ) -> Vec<u8> {
         let resp = self
             .forward_to_upstream_and_get(ctx.request, ctx.query_msg, upstream, &ctx.src)
             .await;
@@ -397,13 +401,21 @@ impl DnsServer {
             ctx.kind.cache_skip_tag(),
         )
         .await;
+
+        resp
     }
 
     /// 向国外上游查询，打印日志，并按条件缓存和打标，最后回复客户端
-    async fn forward_foreign_cached(&self, ctx: &RequestContext<'_>, tag: &str) {
+    async fn forward_foreign_cached(&self, ctx: &RequestContext<'_>, tag: &str) -> Vec<u8> {
         let upstream = &self.foreign_upstream;
         let resp = self
-            .foreign_query(ctx.request, ctx.query_msg, upstream, self.timeout)
+            .foreign_query(
+                ctx.request,
+                ctx.query_msg,
+                upstream,
+                self.timeout,
+                ctx.clean_domain,
+            )
             .await;
 
         debug_print_first_ip(&resp, tag, ctx.clean_domain, upstream, None);
@@ -413,9 +425,11 @@ impl DnsServer {
             .await;
 
         let _ = self.socket.send_to(&resp, ctx.src).await;
+
+        resp
     }
 
-    pub async fn forward_by_static_rules(&self, ctx: &RequestContext<'_>) -> bool {
+    pub async fn forward_by_static_rules(&self, ctx: &RequestContext<'_>) -> Option<Vec<u8>> {
         if let (Some(suffixes), Some(upstream)) = (&self.special_suffixes, &self.special_upstream) {
             for suffix in suffixes {
                 if domain_matches_suffix_canonical(ctx.clean_domain, suffix) {
@@ -425,10 +439,11 @@ impl DnsServer {
                         ctx.clean_domain
                     );
 
-                    self.forward_and_cache(ctx, upstream, ctx.kind.special_tag())
+                    let resp = self
+                        .forward_and_cache(ctx, upstream, ctx.kind.special_tag())
                         .await;
 
-                    return true;
+                    return Some(resp);
                 }
             }
         }
@@ -442,10 +457,11 @@ impl DnsServer {
             );
 
             let upstream = self.domestic_upstream;
-            self.forward_and_cache(ctx, &upstream, ctx.kind.force_domestic_tag())
+            let resp = self
+                .forward_and_cache(ctx, &upstream, ctx.kind.force_domestic_tag())
                 .await;
 
-            return true;
+            return Some(resp);
         }
 
         if is_forced_canonical(ctx.clean_domain, &self.force_foreign) {
@@ -456,10 +472,11 @@ impl DnsServer {
                 self.foreign_upstream
             );
 
-            self.forward_foreign_cached(ctx, ctx.kind.force_foreign_tag())
+            let resp = self
+                .forward_foreign_cached(ctx, ctx.kind.force_foreign_tag())
                 .await;
 
-            return true;
+            return Some(resp);
         }
 
         if let Some(ref gfw) = self.gfw_checker
@@ -471,12 +488,13 @@ impl DnsServer {
                 ctx.clean_domain
             );
 
-            self.forward_foreign_cached(ctx, ctx.kind.gfwlist_tag())
+            let resp = self
+                .forward_foreign_cached(ctx, ctx.kind.gfwlist_tag())
                 .await;
-            return true;
+            return Some(resp);
         }
 
-        false
+        None
     }
 
     pub fn should_use_domestic_a_response(
@@ -653,17 +671,17 @@ impl DnsServer {
         }
     }
 
-    pub async fn handle_address_request(&self, ctx: RequestContext<'_>) {
+    pub async fn handle_address_request(&self, ctx: RequestContext<'_>) -> Vec<u8> {
         // 如果禁用了 AAAA，则不查缓存、不查上游，直接返回 NODATA
         if ctx.kind == AddressQueryKind::Aaaa && !self.enable_ipv6_aaaa {
             let nodata = build_nodata_response(ctx.query_msg);
             let _ = self.socket.send_to(&nodata, ctx.src).await;
-            return;
+            return nodata;
         }
 
         // Hosts 覆盖
-        if self.handle_hosts_override(&ctx).await {
-            return;
+        if let Some(resp) = self.handle_hosts_override(&ctx).await {
+            return resp;
         }
 
         // 广告屏蔽：HTTPS 查询返回 NODATA
@@ -685,11 +703,11 @@ impl DnsServer {
                 }
             };
             let _ = self.socket.send_to(&blocked_response, ctx.src).await;
-            return;
+            return blocked_response;
         }
 
         // 缓存检查
-        if self
+        if let Some(resp) = self
             .send_cached_response(
                 ctx.clean_domain,
                 ctx.kind.cache_qtype(),
@@ -699,12 +717,12 @@ impl DnsServer {
             )
             .await
         {
-            return;
+            return resp;
         }
 
         // special suffix / force domestic / force foreign / gfwlist
-        if self.forward_by_static_rules(&ctx).await {
-            return;
+        if let Some(resp) = self.forward_by_static_rules(&ctx).await {
+            return resp;
         }
 
         // 普通域名：先查国内，根据 A/AAAA 各自规则判断是否使用国内结果
@@ -742,6 +760,7 @@ impl DnsServer {
                     ctx.query_msg,
                     &self.foreign_upstream,
                     self.timeout,
+                    ctx.clean_domain,
                 )
                 .await;
             self.cache_and_mark_if_ok(&resp, ctx.clean_domain, ctx.kind.cache_qtype())
@@ -758,6 +777,7 @@ impl DnsServer {
         );
 
         let _ = self.socket.send_to(&final_resp, ctx.src).await;
+        final_resp
     }
 
     pub async fn send_cached_response(
@@ -767,20 +787,16 @@ impl DnsServer {
         req_id: u16,
         src: SocketAddr,
         hit_tag: &str,
-    ) -> bool {
-        let Some(cache) = &self.cache else {
-            return false;
-        };
+    ) -> Option<Vec<u8>> {
+        let cache = self.cache.as_ref()?;
 
-        let Some(data) = cache.get_response(domain, qtype_num, req_id).await else {
-            return false;
-        };
+        let data = cache.get_response(domain, qtype_num, req_id).await?;
 
         debug!("[{}] {}", hit_tag, domain);
 
         let _ = self.socket.send_to(&data, src).await;
 
-        true
+        Some(data)
     }
 
     pub async fn cache_response(
@@ -895,7 +911,7 @@ impl DnsServer {
         let raw_domain = query.name().to_utf8().to_string();
         let clean_domain = canonical_domain(&raw_domain);
 
-        match qtype {
+        let final_resp = match qtype {
             RecordType::A => {
                 let ctx = RequestContext {
                     kind: AddressQueryKind::A,
@@ -905,7 +921,7 @@ impl DnsServer {
                     src,
                 };
 
-                self.handle_address_request(ctx).await;
+                Some(self.handle_address_request(ctx).await)
             }
 
             RecordType::AAAA => {
@@ -917,7 +933,7 @@ impl DnsServer {
                     src,
                 };
 
-                self.handle_address_request(ctx).await;
+                Some(self.handle_address_request(ctx).await)
             }
 
             RecordType::HTTPS => {
@@ -928,7 +944,7 @@ impl DnsServer {
                     clean_domain: &clean_domain,
                     src,
                 };
-                self.handle_address_request(ctx).await;
+                Some(self.handle_address_request(ctx).await)
             }
 
             _ => {
@@ -937,15 +953,59 @@ impl DnsServer {
                 let _ = self
                     .forward_to_upstream(&request, &query_msg, &self.domestic_upstream, &src)
                     .await;
+                None
             }
-        }
+        };
 
         let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
 
-        debug!(
-            "[DONE] {} type={:?} from={} cost={:.3}ms",
-            clean_domain, qtype, src, elapsed_ms
-        );
+        // 提取第一个 IP 用于日志
+        let first_ip = final_resp.as_ref().and_then(|resp| {
+            extract_answer_ips(resp)
+                .ok()
+                .and_then(|ips| ips.into_iter().next())
+        });
+
+        match (qtype, first_ip) {
+            (_, Some(ip)) => {
+                debug!(
+                    "[DONE] {} type={:?} from={} cost={:.3}ms ip={}",
+                    clean_domain, qtype, src, elapsed_ms, ip
+                );
+            }
+            (RecordType::A | RecordType::AAAA | RecordType::HTTPS, None) => {
+                // 检查 RCODE：SERVFAIL 才告警，NoError/NXDOMAIN 是正常结果
+                let rcode = final_resp
+                    .as_ref()
+                    .and_then(|resp| Message::from_vec(resp).ok().map(|m| m.response_code()));
+                match rcode {
+                    Some(ResponseCode::NoError) => {
+                        debug!(
+                            "[DONE] {} type={:?} from={} cost={:.3}ms (NODATA)",
+                            clean_domain, qtype, src, elapsed_ms
+                        );
+                    }
+                    Some(ResponseCode::NXDomain) => {
+                        debug!(
+                            "[DONE] {} type={:?} from={} cost={:.3}ms (NXDOMAIN)",
+                            clean_domain, qtype, src, elapsed_ms
+                        );
+                    }
+                    _ => {
+                        warn!(
+                            "[DONE] {} type={:?} from={} cost={:.3}ms (no answer, rcode={:?})",
+                            clean_domain, qtype, src, elapsed_ms, rcode
+                        );
+                    }
+                }
+            }
+            _ => {
+                debug!(
+                    "[DONE] {} type={:?} from={} cost={:.3}ms (non-A/AAAA response)",
+                    clean_domain, qtype, src, elapsed_ms
+                );
+            }
+        }
     }
 
     pub async fn send_dns_query(&self, request: &[u8], upstream: &SocketAddr) -> Option<Vec<u8>> {
