@@ -62,6 +62,33 @@ pub(crate) fn domain_matches_suffix_canonical(domain: &str, suffix: &str) -> boo
     false
 }
 
+/// 检查域名是否匹配强制列表中的任一条目。
+///
+/// 注意：会为每个 pattern 分配一个 String 做规范化。
+/// 如果 domain 已规范化，请使用 `is_forced_canonical`。
+#[cfg(test)]
+fn is_forced(domain: &str, list: &Option<Vec<String>>) -> bool {
+    let Some(items) = list else {
+        return false;
+    };
+
+    items
+        .iter()
+        .any(|pattern| domain_matches_suffix(domain, pattern))
+}
+
+/// 检查域名是否匹配强制列表中的任一条目。
+/// 与 `is_forced` 相同，但假设 domain 已规范化，跳过 `canonical_domain` 分配。
+pub fn is_forced_canonical(domain: &str, list: &Option<Vec<String>>) -> bool {
+    let Some(items) = list else {
+        return false;
+    };
+
+    items
+        .iter()
+        .any(|pattern| domain_matches_suffix_canonical(domain, pattern))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,31 +354,4 @@ mod tests {
         let list = Some(vec!["google.com".to_string()]);
         assert!(!is_forced_canonical("example.org", &list));
     }
-}
-
-/// 检查域名是否匹配强制列表中的任一条目。
-///
-/// 注意：会为每个 pattern 分配一个 String 做规范化。
-/// 如果 domain 已规范化，请使用 `is_forced_canonical`。
-#[cfg(test)]
-fn is_forced(domain: &str, list: &Option<Vec<String>>) -> bool {
-    let Some(items) = list else {
-        return false;
-    };
-
-    items
-        .iter()
-        .any(|pattern| domain_matches_suffix(domain, pattern))
-}
-
-/// 检查域名是否匹配强制列表中的任一条目。
-/// 与 `is_forced` 相同，但假设 domain 已规范化，跳过 `canonical_domain` 分配。
-pub fn is_forced_canonical(domain: &str, list: &Option<Vec<String>>) -> bool {
-    let Some(items) = list else {
-        return false;
-    };
-
-    items
-        .iter()
-        .any(|pattern| domain_matches_suffix_canonical(domain, pattern))
 }
