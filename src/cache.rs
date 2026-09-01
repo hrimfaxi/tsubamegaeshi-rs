@@ -2,18 +2,20 @@ use crate::dns_utils::response_cache_ttl;
 use hickory_proto::op::Message;
 use lru::LruCache;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::debug;
 
+/// 缓存条目。data 一旦写入不再修改，故用定长的 `Box<[u8]>`
+/// 而非 `Arc<Vec<u8>>`：省去堆上的 ArcInner（引用计数 16B + Vec 头 24B），
+/// 代价是 entry 里胖指针比 Arc 指针多 8B，净省 32B/条。
 pub struct CacheEntry {
-    pub data: Arc<Vec<u8>>,
+    pub data: Box<[u8]>,
     pub expire: Instant,
 }
 
 pub struct DnsCache {
-    inner: Mutex<LruCache<(String, u16), CacheEntry>>,
+    inner: Mutex<LruCache<(Box<str>, u16), CacheEntry>>,
 }
 
 impl DnsCache {
@@ -24,7 +26,7 @@ impl DnsCache {
     }
 
     pub async fn get_response(&self, domain: &str, qtype_num: u16, req_id: u16) -> Option<Vec<u8>> {
-        let key = (domain.to_string(), qtype_num);
+        let key = (Box::from(domain), qtype_num);
 
         let cached_data = {
             let mut cache = self.inner.lock().await;
@@ -34,7 +36,8 @@ impl DnsCache {
 
             let data = if let Some(entry) = cache.get(&key) {
                 if entry.expire > now {
-                    Some(entry.data.clone())
+                    // 存的是共享只读报文，需拷贝后重写 ID 返回给客户端
+                    Some(entry.data.to_vec())
                 } else {
                     expired = true;
                     None
@@ -50,8 +53,7 @@ impl DnsCache {
             data
         };
 
-        let data = cached_data?;
-        let mut data = Arc::try_unwrap(data).unwrap_or_else(|arc| (*arc).clone());
+        let mut data = cached_data?;
         crate::dns_utils::rewrite_dns_id(&mut data, req_id);
         Some(data)
     }
@@ -93,9 +95,10 @@ impl DnsCache {
 
         let mut cache = self.inner.lock().await;
         cache.put(
-            (domain.to_string(), qtype_num),
+            (Box::from(domain), qtype_num),
             CacheEntry {
-                data: Arc::new(response.to_vec()),
+                // 一次按实际长度精确分配，替代 to_vec + Arc 的两次分配
+                data: Box::from(response),
                 expire,
             },
         );
@@ -124,9 +127,9 @@ mod tests {
         ) {
             let mut cache = self.inner.lock().await;
             cache.put(
-                (domain.to_string(), qtype),
+                (Box::from(domain), qtype),
                 CacheEntry {
-                    data: Arc::new(data),
+                    data: data.into_boxed_slice(),
                     expire,
                 },
             );
