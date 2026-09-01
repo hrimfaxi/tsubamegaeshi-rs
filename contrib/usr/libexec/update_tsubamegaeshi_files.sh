@@ -8,7 +8,7 @@ MMDB_SHA_URL="https://raw.githubusercontent.com/kkkgo/Country-only-cn-private.mm
 GFW_PATH="/etc/tsubamegaeshi-rs/gfwlist.txt"
 GFW_URL="https://raw.githubusercontent.com/gfwlist/gfwlist/refs/heads/master/gfwlist.txt"
 
-ADBLOCK_PATH="/etc/tsubamegaeshi-rs/adblockadminlite.txt"
+ADBLOCK_PATH="/etc/tsubamegaeshi-rs/adblockdomainlite.txt"
 ADBLOCK_URL="https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockdomainlite.txt"
 
 LOCK="/tmp/update_tsubamegaeshi.lock"
