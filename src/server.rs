@@ -2031,6 +2031,82 @@ mod tests {
         assert_eq!(dropped.load(Ordering::SeqCst), 2);
     }
 
+    /// 当前进程打开的 fd 数（Linux /proc）
+    fn open_fd_count() -> Option<usize> {
+        std::fs::read_dir("/proc/self/fd").ok().map(|d| d.count())
+    }
+
+    /// abort 掉的输家必须立刻归还它绑定的临时 UDP socket，不能每轮攒一个 fd。
+    ///
+    /// 输家用真实的 `query_upstream_once`（bind → connect → send → 挂在 30s 的 recv 上），
+    /// 赢家 20ms 后给出有效应答，此时输家必然已经绑定并阻塞在 recv。
+    #[tokio::test]
+    async fn test_race_abort_releases_loser_udp_socket() {
+        // 黑洞上游：真实端口，永不应答
+        let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bh = blackhole.local_addr().unwrap();
+
+        let iterations = 40usize;
+
+        // 预热一轮，让 tokio IO driver 完成惰性初始化，避免首帧 fd 抖动计入差值
+        {
+            let request = a_query().to_vec().unwrap();
+            let loser_req = request.clone();
+            let futs: Vec<BoxedQuery> = vec![
+                (
+                    bh,
+                    Box::pin(async move {
+                        query_upstream_once(&loser_req, &bh, Duration::from_secs(30))
+                            .await
+                            .ok()
+                    }),
+                ),
+                (
+                    addr(3),
+                    delayed(
+                        a_answer(Ipv4Addr::new(9, 9, 9, 9)),
+                        Duration::from_millis(20),
+                    ),
+                ),
+            ];
+            assert!(race_queries(&request, futs).await.is_some());
+        }
+
+        let baseline = open_fd_count().expect("/proc/self/fd available on Linux");
+
+        for _ in 0..iterations {
+            let request = a_query().to_vec().unwrap();
+            let loser_req = request.clone();
+            let winner = a_answer(Ipv4Addr::new(9, 9, 9, 9));
+            let futs: Vec<BoxedQuery> = vec![
+                (
+                    bh,
+                    Box::pin(async move {
+                        query_upstream_once(&loser_req, &bh, Duration::from_secs(30))
+                            .await
+                            .ok()
+                    }),
+                ),
+                (addr(3), delayed(winner.clone(), Duration::from_millis(20))),
+            ];
+
+            let resp = race_queries(&request, futs)
+                .await
+                .expect("winner must answer");
+            assert_eq!(classify_answer(&request, &resp), RaceVerdict::Usable);
+        }
+
+        let after = open_fd_count().unwrap();
+        let growth = after.saturating_sub(baseline);
+
+        // 每轮 loser 都会新建一个临时 socket；若 abort 后没关闭，这里会涨 40。
+        // 阈值放宽到 10 以容忍同进程其它测试的 fd 抖动。
+        assert!(
+            growth < iterations / 4,
+            "loser UDP sockets leaked: baseline={baseline} after={after} growth={growth} over {iterations} races"
+        );
+    }
+
     #[tokio::test]
     async fn test_race_queries_all_unusable_returns_fallback_packet() {
         let request = a_query().to_vec().unwrap();
