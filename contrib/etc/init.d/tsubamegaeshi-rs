@@ -15,13 +15,40 @@ toml_escape() {
 	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+# Emit an upstream option: single address stays a string (兼容旧配置),
+# 多个地址（空格或逗号分隔）输出为 TOML 数组 -> 并发竞速查询
+# 输出始终取自拆分后的地址本身，避免 "8.8.8.8," / " 8.8.8.8 " 这类带杂质的输入被原样写进配置
+emit_upstream() {
+	local key="$1" raw="$2"
+	local addrs single count=0 a
+	addrs="$(printf '%s' "$raw" | tr ',' ' ')"
+	for a in $addrs; do
+		single="$a"
+		count=$((count + 1))
+	done
+
+	if [ "$count" -le 1 ]; then
+		echo "${key} = \"$(toml_escape "$single")\"" >> $CONF_FILE
+		return
+	fi
+
+	printf '%s = [' "$key" >> $CONF_FILE
+	local first=1
+	for a in $addrs; do
+		[ $first -eq 0 ] && printf "," >> $CONF_FILE
+		printf '"%s"' "$(toml_escape "$a")" >> $CONF_FILE
+		first=0
+	done
+	echo "]" >> $CONF_FILE
+}
+
 get_config() {
 	config_get enabled $1 enabled 0
 	config_get listen_port $1 listen_port 5336
 	config_get listen_address $1 listen_address "127.0.0.1"
 	config_get log_level $1 log_level "info"
-	config_get domestic_dns $1 domestic_dns "223.5.5.5"
-	config_get foreign_dns $1 foreign_dns "8.8.8.8"
+	config_get domestic_dns $1 domestic_dns "223.5.5.5,119.29.29.29,2400:3200::1,2402:4e00::"
+	config_get foreign_dns $1 foreign_dns "1.0.0.1,8.8.8.8,8.8.4.4,1.1.1.1,2606:4700:4700::1111,2606:4700:4700::1001,2001:4860:4860::8888,2001:4860:4860::8844"
 	config_get query_timeout_sec $1 query_timeout_sec 10
 	config_get special_suffixes $1 special_suffixes ""
 	config_get special_upstream $1 special_upstream ""
@@ -40,7 +67,7 @@ get_config() {
 	config_get trust_domestic_nodata_reply $1 trust_domestic_nodata_reply 0
 	config_get redirect $1 redirect 0
 	config_get disable_ipv6 $1 disable_ipv6 0
-	config_get max_in_flight $1 max_in_flight 128
+	config_get max_in_flight $1 max_in_flight 1024
 }
 
 generate_config() {
@@ -50,7 +77,7 @@ generate_config() {
 	# Sanitize numeric values
 	case "$cache_size" in ''|*[!0-9]*) cache_size=4096 ;; esac
 	case "$query_timeout_sec" in ''|*[!0-9]*) query_timeout_sec=10 ;; esac
-	case "$max_in_flight" in ''|*[!0-9]*) max_in_flight=128 ;; esac
+	case "$max_in_flight" in ''|*[!0-9]*) max_in_flight=1024 ;; esac
 	case "$max_polluted_packets" in ''|*[!0-9]*) max_polluted_packets=5 ;; esac
 	case "$gfbloom_fp_rate" in ''|*[!0-9.]*) gfbloom_fp_rate=0.001 ;; esac
 	case "$adblock_fp_rate" in ''|*[!0-9.]*) adblock_fp_rate=0.001 ;; esac
@@ -68,17 +95,14 @@ generate_config() {
 	esac
 
 	# Escape string values for TOML safety
-	local _log_level _domestic_dns _foreign_dns _mmdb_path _ipv4_list _ipv6_list
-	local _gfwlist_path _adblock_path _special_upstream
+	local _log_level _mmdb_path _ipv4_list _ipv6_list
+	local _gfwlist_path _adblock_path
 	_log_level="$(toml_escape "$log_level")"
-	_domestic_dns="$(toml_escape "$domestic_dns")"
-	_foreign_dns="$(toml_escape "$foreign_dns")"
 	_mmdb_path="$(toml_escape "$mmdb_path")"
 	_ipv4_list="$(toml_escape "$ipv4_list")"
 	_ipv6_list="$(toml_escape "$ipv6_list")"
 	_gfwlist_path="$(toml_escape "$gfwlist_path")"
 	_adblock_path="$(toml_escape "$adblock_path")"
-	_special_upstream="$(toml_escape "$special_upstream")"
 
 	cat > $CONF_FILE <<EOF
 # Tsubamegaeshi-rs Configuration
@@ -87,8 +111,12 @@ generate_config() {
 listen = "${listen_str}"
 log_level = "${_log_level}"
 
-domestic_upstream = "${_domestic_dns}"
-foreign_upstream = "${_foreign_dns}"
+EOF
+
+	emit_upstream domestic_upstream "$domestic_dns"
+	emit_upstream foreign_upstream "$foreign_dns"
+
+	cat >> $CONF_FILE <<EOF
 
 mmdb_path = "${_mmdb_path}"
 cache_size = ${cache_size}
@@ -125,7 +153,7 @@ EOF
 	# Special suffix
 	if [ -n "$special_suffixes" ] && [ -n "$special_upstream" ]; then
 		echo "" >> $CONF_FILE
-		echo "special_upstream = \"${_special_upstream}\"" >> $CONF_FILE
+		emit_upstream special_upstream "$special_upstream"
 		printf "special_suffixes = [" >> $CONF_FILE
 		local first=1
 		for suffix in $special_suffixes; do
@@ -355,6 +383,11 @@ start_service() {
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_set_param respawn
+
+	# 竞速让每个 in-flight 请求占用 N 个临时 UDP socket（N = 上游个数），
+	# 1024 并发 × 多上游很容易顶到 procd 默认 nofile=1024，这里统一抬高
+	procd_set_param limits nofile="1048576 1048576"
+
 	procd_close_instance tsubamegaeshi-rs
 
 	[ "$redirect" -ne 1 ] && restore_dhcp_setting

@@ -29,7 +29,7 @@ use domain_utils::{canonical_domain, normalize_domain_list};
 use gfwlist::{BloomDomainChecker, GfwlistDecoder};
 use mark_sites::{CommandNftManager, MarkGroup, MarkRule, MarkSites, NFT_TABLE_PREFIX};
 use pollution::PollutionChecker;
-use server::{DnsServer, bind_listen_socket, parse_hosts, parse_upstream};
+use server::{DnsServer, bind_listen_socket, parse_hosts, parse_upstreams};
 use task_guard::TaskGuard;
 
 #[derive(Parser)]
@@ -184,11 +184,11 @@ async fn main() -> anyhow::Result<()> {
 
     let special_upstream = config
         .special_upstream
-        .as_deref()
-        .map(|s| parse_upstream(s, "special_upstream"))
+        .as_ref()
+        .map(|u| parse_upstreams(u, "special_upstream"))
         .transpose()?;
-    let domestic_upstream = parse_upstream(&config.domestic_upstream, "domestic_upstream")?;
-    let foreign_upstream = parse_upstream(&config.foreign_upstream, "foreign_upstream")?;
+    let domestic_upstream = parse_upstreams(&config.domestic_upstream, "domestic_upstream")?;
+    let foreign_upstream = parse_upstreams(&config.foreign_upstream, "foreign_upstream")?;
     let cache = NonZeroUsize::new(config.cache_size).map(DnsCache::new);
 
     let (hosts_v4, hosts_v6) = config.hosts.as_ref().map_or((None, None), |h| {

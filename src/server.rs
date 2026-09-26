@@ -1,10 +1,13 @@
 use anyhow::Context;
-use hickory_proto::op::{Message, ResponseCode};
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
+use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::RecordType;
 use maxminddb::Reader;
 use serde::Deserialize;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -50,9 +53,9 @@ pub struct RequestContext<'a> {
 
 pub struct DnsServer {
     pub socket: UdpSocket,
-    pub special_upstream: Option<SocketAddr>,
-    pub domestic_upstream: SocketAddr,
-    pub foreign_upstream: SocketAddr,
+    pub special_upstream: Option<Vec<SocketAddr>>,
+    pub domestic_upstream: Vec<SocketAddr>,
+    pub foreign_upstream: Vec<SocketAddr>,
     pub mmdb: Reader<Vec<u8>>,
     pub special_suffixes: Option<Vec<String>>,
     pub cache: Option<DnsCache>,
@@ -81,121 +84,291 @@ async fn bind_ephemeral_udp_for(upstream: &SocketAddr) -> std::io::Result<UdpSoc
     }
 }
 
+/// 竞速中一个上游应答的裁决结果
+#[derive(Debug, PartialEq)]
+enum RaceVerdict {
+    /// 有资格胜出
+    Usable,
+    /// 与请求对得上、但 RCODE 为 SERVFAIL / REFUSED：该上游自身有问题
+    SoftFailure,
+    /// 无法解析、不是应答、ID 对不上、问题段（QNAME/QTYPE/QCLASS）与请求不符
+    Unusable,
+}
+
+/// 判定上游应答是否"有资格"赢得竞速。
+///
+/// 只有完整、可解析、确为应答、且 ID 与问题段（QNAME/QTYPE/QCLASS）都与请求一致的
+/// 报文才算有效应答；SERVFAIL / REFUSED 与各类畸形包都只是兜底候选，不打断其它上游。
+/// 关联性校验先于 RCODE 分类：ID 或问题段对不上的 SERVFAIL 是无关报文，不是软失败。
+fn classify_answer(request: &[u8], resp: &[u8]) -> RaceVerdict {
+    let Ok(msg) = Message::from_vec(resp) else {
+        return RaceVerdict::Unusable;
+    };
+
+    if msg.message_type() != MessageType::Response {
+        return RaceVerdict::Unusable;
+    }
+
+    if request.len() < 2 || msg.id() != u16::from_be_bytes([request[0], request[1]]) {
+        return RaceVerdict::Unusable;
+    }
+
+    // 请求本身解析不出来时不做问题段比对，避免误伤
+    if let Ok(req) = Message::from_vec(request) {
+        match (req.queries().first(), msg.queries().first()) {
+            (Some(a), Some(b)) => {
+                if a.query_type() != b.query_type()
+                    || a.query_class() != b.query_class()
+                    || a.name().to_lowercase() != b.name().to_lowercase()
+                {
+                    return RaceVerdict::Unusable;
+                }
+            }
+            (Some(_), None) => return RaceVerdict::Unusable,
+            _ => {}
+        }
+    }
+
+    if matches!(
+        msg.response_code(),
+        ResponseCode::ServFail | ResponseCode::Refused
+    ) {
+        return RaceVerdict::SoftFailure;
+    }
+
+    RaceVerdict::Usable
+}
+
+/// 并发竞速：同时轮询多个上游查询 future，第一个返回有效应答（Some）者胜出，
+/// 其余 future 直接丢弃，等于 abort（底层临时 socket 随之关闭）。
+///
+/// 软失败（SERVFAIL / REFUSED）与畸形包不判胜，继续等其它上游；它们只作为兜底候选，
+/// 只有没有任何上游给出有效应答时才把第一个兜底候选交回客户端（保留上游原始报文），
+/// 一个兜底候选都没有（全部超时/socket 错误）则返回 None。
+async fn race_queries<Fut: Future<Output = Option<Vec<u8>>>>(
+    request: &[u8],
+    candidates: Vec<(SocketAddr, Fut)>,
+) -> Option<Vec<u8>> {
+    let mut inflight: FuturesUnordered<_> = candidates
+        .into_iter()
+        .map(|(upstream, fut)| async move { (upstream, fut.await) })
+        .collect();
+
+    let mut fallback: Option<Vec<u8>> = None;
+
+    while let Some((upstream, result)) = inflight.next().await {
+        let Some(resp) = result else { continue };
+
+        match classify_answer(request, &resp) {
+            RaceVerdict::Usable => {
+                debug!(
+                    "race: {} won, aborted {} loser(s)",
+                    upstream,
+                    inflight.len()
+                );
+                return Some(resp);
+            }
+            verdict => {
+                debug!(
+                    "race: {} answer unusable ({:?}), still waiting {} other(s)",
+                    upstream,
+                    verdict,
+                    inflight.len()
+                );
+                if fallback.is_none() {
+                    fallback = Some(resp);
+                }
+            }
+        }
+    }
+
+    fallback
+}
+
+/// 向单个上游发一次查询并等待首个应答（不重试）。
+/// 使用独立临时 socket（不是共享监听 socket），地址族跟随上游。
+async fn query_upstream_once(
+    request: &[u8],
+    upstream: &SocketAddr,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let socket = bind_ephemeral_udp_for(upstream)
+        .await
+        .map_err(|e| format!("bind ephemeral socket failed: {e}"))?;
+
+    if let Err(e) = socket.connect(upstream).await {
+        return Err(format!("connect (UDP) unexpectedly failed: {e}"));
+    }
+
+    if let Err(e) = socket.send(request).await {
+        return Err(format!("send failed: {e}"));
+    }
+
+    let mut buf = [0u8; 4096];
+    let recv_result = tokio::time::timeout(timeout, socket.recv(&mut buf)).await;
+
+    match recv_result {
+        Ok(Ok(len)) => {
+            let resp = buf[..len].to_vec();
+            if request.len() >= 2 && resp.len() >= 2 && request[0..2] != resp[0..2] {
+                return Err("response ID mismatch".to_string());
+            }
+            Ok(resp)
+        }
+        Ok(Err(e)) => Err(format!("recv failed: {e}")),
+        Err(_elapsed) => Err("timeout waiting for response".to_string()),
+    }
+}
+
+/// 单个国外上游：一次发送，循环接收，污染检测
+/// 语义：最多丢弃 `checker.max_packets` 个污染包，遇到干净包立刻返回
+/// ID 不匹配或解析失败的包直接丢弃，不计入污染额度
+/// 超时、socket 错误或污染额度耗尽返回 None（交给竞速的其他上游）
+async fn foreign_query_filtered(
+    request: &[u8],
+    upstream: &SocketAddr,
+    timeout: Duration,
+    domain: &str,
+    checker: &PollutionChecker,
+) -> Option<Vec<u8>> {
+    if request.len() < 2 {
+        error!("Foreign multiple recv: request too short (< 2 bytes)");
+        return None;
+    }
+
+    let socket = match bind_ephemeral_udp_for(upstream).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Foreign multiple recv: bind failed: {}", e);
+            return None;
+        }
+    };
+    if let Err(e) = socket.connect(upstream).await {
+        error!("Foreign multiple recv: connect failed: {}", e);
+        return None;
+    }
+    if let Err(e) = socket.send(request).await {
+        error!("Foreign multiple recv: send failed: {}", e);
+        return None;
+    }
+
+    let mut buf = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + timeout;
+    let req_id = u16::from_be_bytes([request[0], request[1]]);
+    let mut polluted_count = 0;
+    let mut recv_count = 0;
+    let max_total_packets = checker.max_packets.saturating_mul(4).max(16);
+
+    loop {
+        let recv_fut = socket.recv(&mut buf);
+        match timeout_at(deadline, recv_fut).await {
+            Ok(Ok(len)) => {
+                recv_count += 1;
+                if recv_count > max_total_packets {
+                    warn!("recv max total {} reached, giving up", max_total_packets);
+                    return None;
+                }
+
+                if len < 2 {
+                    debug!("recv #{}: too short", recv_count);
+                    continue;
+                }
+
+                let resp_id = u16::from_be_bytes([buf[0], buf[1]]);
+                if resp_id != req_id {
+                    debug!("recv #{}: id mismatch", recv_count);
+                    continue;
+                }
+
+                let data = buf[..len].to_vec();
+                match checker.check(&data) {
+                    PollutionResult::Clean => {
+                        debug!(
+                            "recv #{}: clean (after {} polluted)",
+                            recv_count, polluted_count
+                        );
+                        return Some(data);
+                    }
+                    PollutionResult::Invalid => {
+                        warn!("recv #{}: invalid packet", recv_count);
+                        continue;
+                    }
+                    PollutionResult::Polluted => {
+                        polluted_count += 1;
+                        if polluted_count >= checker.max_packets {
+                            warn!(
+                                "recv #{}: polluted (max {} reached), giving up",
+                                recv_count, checker.max_packets
+                            );
+                            return None;
+                        }
+                        debug!(
+                            "recv #{}: polluted ({}/{})",
+                            recv_count, polluted_count, checker.max_packets
+                        );
+                        continue;
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                warn!("recv error after {} packets: {}", recv_count, e);
+                return None;
+            }
+            Err(_) => {
+                warn!(
+                    "[FOREIGN-TIMEOUT] {} -> {} timeout after {} packets ({:?})",
+                    domain, upstream, recv_count, timeout
+                );
+                return None;
+            }
+        }
+    }
+}
+
 impl DnsServer {
-    /// 国外上游专用：一次发送，循环接收，污染检测
-    /// 语义：最多丢弃 `checker.max_packets` 个污染包，遇到干净包立刻返回
-    /// ID 不匹配或解析失败的包直接丢弃，不计入污染额度
+    /// 单个国外上游查询：污染检测开启时走多接收过滤循环，否则退化为普通单次查询
+    async fn foreign_query_inner(
+        &self,
+        request: &[u8],
+        upstream: &SocketAddr,
+        timeout: Duration,
+        domain: &str,
+    ) -> Option<Vec<u8>> {
+        match self
+            .pollution_checker
+            .as_ref()
+            .filter(|c| c.max_packets > 0)
+        {
+            Some(checker) => {
+                foreign_query_filtered(request, upstream, timeout, domain, checker).await
+            }
+            None => self.send_dns_query(request, upstream).await,
+        }
+    }
+
+    /// 向多个国外上游并发查询，第一个拿到干净应答的胜出；
+    /// 全部失败（超时/污染）则回 SERVFAIL
     async fn foreign_query(
         &self,
         request: &[u8],
         query: &Message,
-        upstream: &SocketAddr,
+        upstreams: &[SocketAddr],
         timeout: Duration,
         domain: &str,
     ) -> Vec<u8> {
-        let checker = match self.pollution_checker.as_ref() {
-            Some(c) if c.max_packets > 0 => c,
-            _ => {
-                return self
-                    .query_upstream_or_servfail(request, query, upstream, None)
-                    .await;
-            }
-        };
+        let futures = upstreams
+            .iter()
+            .map(|upstream| {
+                (
+                    *upstream,
+                    self.foreign_query_inner(request, upstream, timeout, domain),
+                )
+            })
+            .collect();
 
-        if request.len() < 2 {
-            error!("Foreign multiple recv: request too short (< 2 bytes)");
-            return build_servfail_response(query);
-        }
-
-        let socket = match bind_ephemeral_udp_for(upstream).await {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Foreign multiple recv: bind failed: {}", e);
-                return build_servfail_response(query);
-            }
-        };
-        if let Err(e) = socket.connect(upstream).await {
-            error!("Foreign multiple recv: connect failed: {}", e);
-            return build_servfail_response(query);
-        }
-        if let Err(e) = socket.send(request).await {
-            error!("Foreign multiple recv: send failed: {}", e);
-            return build_servfail_response(query);
-        }
-
-        let mut buf = [0u8; 4096];
-        let deadline = tokio::time::Instant::now() + timeout;
-        let req_id = u16::from_be_bytes([request[0], request[1]]);
-        let mut polluted_count = 0;
-        let mut recv_count = 0;
-        let max_total_packets = checker.max_packets.saturating_mul(4).max(16);
-
-        loop {
-            let recv_fut = socket.recv(&mut buf);
-            match timeout_at(deadline, recv_fut).await {
-                Ok(Ok(len)) => {
-                    recv_count += 1;
-                    if recv_count > max_total_packets {
-                        warn!(
-                            "recv max total {} reached, returning SERVFAIL",
-                            max_total_packets
-                        );
-                        return build_servfail_response(query);
-                    }
-
-                    if len < 2 {
-                        debug!("recv #{}: too short", recv_count);
-                        continue;
-                    }
-
-                    let resp_id = u16::from_be_bytes([buf[0], buf[1]]);
-                    if resp_id != req_id {
-                        debug!("recv #{}: id mismatch", recv_count);
-                        continue;
-                    }
-
-                    let data = buf[..len].to_vec();
-                    match checker.check(&data) {
-                        PollutionResult::Clean => {
-                            debug!(
-                                "recv #{}: clean (after {} polluted)",
-                                recv_count, polluted_count
-                            );
-                            return data;
-                        }
-                        PollutionResult::Invalid => {
-                            warn!("recv #{}: invalid packet", recv_count);
-                            continue;
-                        }
-                        PollutionResult::Polluted => {
-                            polluted_count += 1;
-                            if polluted_count >= checker.max_packets {
-                                warn!(
-                                    "recv #{}: polluted (max {} reached), returning SERVFAIL",
-                                    recv_count, checker.max_packets
-                                );
-                                return build_servfail_response(query);
-                            }
-                            debug!(
-                                "recv #{}: polluted ({}/{})",
-                                recv_count, polluted_count, checker.max_packets
-                            );
-                            continue;
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    warn!("recv error after {} packets: {}", recv_count, e);
-                    return build_servfail_response(query);
-                }
-                Err(_) => {
-                    warn!(
-                        "[FOREIGN-TIMEOUT] {} -> {} timeout after {} packets ({:?})",
-                        domain, upstream, recv_count, timeout
-                    );
-                    return build_servfail_response(query);
-                }
-            }
+        match race_queries(request, futures).await {
+            Some(resp) => resp,
+            None => build_servfail_response(query),
         }
     }
 
@@ -368,11 +541,11 @@ impl DnsServer {
         &self,
         request: &[u8],
         query: &Message,
-        upstream: &SocketAddr,
+        upstreams: &[SocketAddr],
         client: &SocketAddr,
     ) -> Vec<u8> {
         let data = self
-            .query_upstream_or_servfail(request, query, upstream, None)
+            .race_upstreams_or_servfail(request, query, upstreams)
             .await;
 
         let _ = self.socket.send_to(&data, client).await;
@@ -383,14 +556,14 @@ impl DnsServer {
     pub async fn forward_and_cache(
         &self,
         ctx: &RequestContext<'_>,
-        upstream: &SocketAddr,
+        upstreams: &[SocketAddr],
         tag: &str,
     ) -> Vec<u8> {
         let resp = self
-            .forward_to_upstream_and_get(ctx.request, ctx.query_msg, upstream, &ctx.src)
+            .forward_to_upstream_and_get(ctx.request, ctx.query_msg, upstreams, &ctx.src)
             .await;
 
-        debug_print_first_ip(&resp, tag, ctx.clean_domain, upstream, None);
+        debug_print_first_ip(&resp, tag, ctx.clean_domain, upstreams, None);
 
         self.apply_mark_sites(&resp, ctx.clean_domain).await;
 
@@ -407,18 +580,18 @@ impl DnsServer {
 
     /// 向国外上游查询，打印日志，并按条件缓存和打标，最后回复客户端
     async fn forward_foreign_cached(&self, ctx: &RequestContext<'_>, tag: &str) -> Vec<u8> {
-        let upstream = &self.foreign_upstream;
+        let upstreams = &self.foreign_upstream;
         let resp = self
             .foreign_query(
                 ctx.request,
                 ctx.query_msg,
-                upstream,
+                upstreams,
                 self.timeout,
                 ctx.clean_domain,
             )
             .await;
 
-        debug_print_first_ip(&resp, tag, ctx.clean_domain, upstream, None);
+        debug_print_first_ip(&resp, tag, ctx.clean_domain, upstreams, None);
 
         // 只有 NoError 的响应才缓存和打标
         self.cache_and_mark_if_ok(&resp, ctx.clean_domain, ctx.kind.cache_qtype())
@@ -430,7 +603,8 @@ impl DnsServer {
     }
 
     pub async fn forward_by_static_rules(&self, ctx: &RequestContext<'_>) -> Option<Vec<u8>> {
-        if let (Some(suffixes), Some(upstream)) = (&self.special_suffixes, &self.special_upstream) {
+        if let (Some(suffixes), Some(upstreams)) = (&self.special_suffixes, &self.special_upstream)
+        {
             for suffix in suffixes {
                 if domain_matches_suffix_canonical(ctx.clean_domain, suffix) {
                     debug!(
@@ -440,7 +614,7 @@ impl DnsServer {
                     );
 
                     let resp = self
-                        .forward_and_cache(ctx, upstream, ctx.kind.special_tag())
+                        .forward_and_cache(ctx, upstreams, ctx.kind.special_tag())
                         .await;
 
                     return Some(resp);
@@ -450,15 +624,14 @@ impl DnsServer {
 
         if is_forced_canonical(ctx.clean_domain, &self.force_domestic) {
             debug!(
-                "[{}] {} -> {}",
+                "[{}] {} -> {:?}",
                 ctx.kind.force_domestic_tag(),
                 ctx.clean_domain,
                 self.domestic_upstream
             );
 
-            let upstream = self.domestic_upstream;
             let resp = self
-                .forward_and_cache(ctx, &upstream, ctx.kind.force_domestic_tag())
+                .forward_and_cache(ctx, &self.domestic_upstream, ctx.kind.force_domestic_tag())
                 .await;
 
             return Some(resp);
@@ -466,7 +639,7 @@ impl DnsServer {
 
         if is_forced_canonical(ctx.clean_domain, &self.force_foreign) {
             debug!(
-                "[{}] {} -> {}",
+                "[{}] {} -> {:?}",
                 ctx.kind.force_foreign_tag(),
                 ctx.clean_domain,
                 self.foreign_upstream
@@ -727,14 +900,14 @@ impl DnsServer {
 
         // 普通域名：先查国内，根据 A/AAAA 各自规则判断是否使用国内结果
         debug!(
-            "[{}] {} -> {}",
+            "[{}] {} -> {:?}",
             ctx.kind.domestic_tag(),
             ctx.clean_domain,
             self.domestic_upstream
         );
 
         let domestic_resp = self
-            .send_dns_query(ctx.request, &self.domestic_upstream)
+            .race_dns_query(ctx.request, &self.domestic_upstream)
             .await;
 
         let use_domestic =
@@ -815,22 +988,36 @@ impl DnsServer {
             .await;
     }
 
-    pub async fn query_upstream_or_servfail(
+    /// 并发向多个上游查询，第一个成功应答者胜出；
+    /// 全部失败返回 SERVFAIL
+    pub async fn race_upstreams_or_servfail(
         &self,
         request: &[u8],
         query: &Message,
-        upstream: &SocketAddr,
-        timeout_log: Option<(&str, &str)>,
+        upstreams: &[SocketAddr],
     ) -> Vec<u8> {
-        match self.send_dns_query(request, upstream).await {
+        match self.race_dns_query(request, upstreams).await {
             Some(resp) => resp,
+            None => build_servfail_response(query),
+        }
+    }
 
-            None => {
-                if let Some((tag, domain)) = timeout_log {
-                    warn!("[{}] {} -> SERVFAIL", tag, domain);
-                }
+    /// 并发向多个上游发送同一查询，先返回有效应答的胜出，其余 future 被丢弃（abort）
+    pub async fn race_dns_query(
+        &self,
+        request: &[u8],
+        upstreams: &[SocketAddr],
+    ) -> Option<Vec<u8>> {
+        match upstreams {
+            [] => None,
+            [single] => self.send_dns_query(request, single).await,
+            _ => {
+                let futures = upstreams
+                    .iter()
+                    .map(|upstream| (*upstream, self.send_dns_query(request, upstream)))
+                    .collect();
 
-                build_servfail_response(query)
+                race_queries(request, futures).await
             }
         }
     }
@@ -1031,7 +1218,7 @@ impl DnsServer {
             attempt += 1;
             debug!("Sending DNS query to {} (attempt {})", upstream, attempt);
 
-            match self.try_send_query_once(request, upstream).await {
+            match query_upstream_once(request, upstream, self.timeout).await {
                 Ok(resp) => return Some(resp),
                 Err(e) => {
                     debug!(
@@ -1052,48 +1239,15 @@ impl DnsServer {
         None
     }
 
-    pub async fn try_send_query_once(
-        &self,
-        request: &[u8],
-        upstream: &SocketAddr,
-    ) -> Result<Vec<u8>, String> {
-        let socket = bind_ephemeral_udp_for(upstream)
-            .await
-            .map_err(|e| format!("bind ephemeral socket failed: {e}"))?;
-
-        if let Err(e) = socket.connect(upstream).await {
-            return Err(format!("connect (UDP) unexpectedly failed: {e}"));
-        }
-
-        if let Err(e) = socket.send(request).await {
-            return Err(format!("send failed: {e}"));
-        }
-
-        let mut buf = [0u8; 4096];
-        let recv_result = tokio::time::timeout(self.timeout, socket.recv(&mut buf)).await;
-
-        match recv_result {
-            Ok(Ok(len)) => {
-                let resp = buf[..len].to_vec();
-                if request.len() >= 2 && resp.len() >= 2 && request[0..2] != resp[0..2] {
-                    return Err("response ID mismatch".to_string());
-                }
-                Ok(resp)
-            }
-            Ok(Err(e)) => Err(format!("recv failed: {e}")),
-            Err(_elapsed) => Err("timeout waiting for response".to_string()),
-        }
-    }
-
     pub async fn forward_to_upstream(
         &self,
         request: &[u8],
         query: &Message,
-        upstream: &SocketAddr,
+        upstreams: &[SocketAddr],
         client: &SocketAddr,
     ) -> anyhow::Result<()> {
         let data = self
-            .query_upstream_or_servfail(request, query, upstream, None)
+            .race_upstreams_or_servfail(request, query, upstreams)
             .await;
 
         self.socket.send_to(&data, client).await?;
@@ -1256,12 +1410,42 @@ pub fn parse_upstream(s: &str, field_name: &str) -> anyhow::Result<SocketAddr> {
         .with_context(|| format!("Invalid {}: {}", field_name, s))
 }
 
+/// 单点写法（字符串）与列表写法（字符串数组）都归一化为非空的 Vec，
+/// 重复项去重，保持首次出现的顺序
+pub fn parse_upstreams(
+    one_or_many: &OneOrMany,
+    field_name: &str,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let mut seen = HashSet::new();
+    let addrs: Vec<SocketAddr> = one_or_many
+        .0
+        .iter()
+        .map(|s| parse_upstream(s, field_name))
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|addr| seen.insert(*addr))
+        .collect();
+
+    if addrs.is_empty() {
+        anyhow::bail!("{} cannot be empty", field_name);
+    }
+
+    Ok(addrs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::OneOrMany;
-    use std::collections::HashMap;
+    use crate::pollution::{PollutionChecker, PollutionResult};
+    use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
+    use hickory_proto::rr::{DNSClass, Name, RecordType};
+    use std::collections::{HashMap, HashSet};
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::UdpSocket;
 
     // ========== parse_hosts ==========
 
@@ -1419,5 +1603,685 @@ mod tests {
         // 所以这里测一个明确非法的
         let result = parse_upstream(":::53", "test");
         assert!(result.is_err());
+    }
+
+    // ========== parse_upstreams ==========
+
+    #[test]
+    fn test_parse_upstreams_single_compat() {
+        let result = parse_upstreams(&OneOrMany(vec!["8.8.8.8".to_string()]), "test").unwrap();
+        assert_eq!(
+            result,
+            vec![SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 53)]
+        );
+    }
+
+    #[test]
+    fn test_parse_upstreams_list() {
+        let result = parse_upstreams(
+            &OneOrMany(vec![
+                "223.5.5.5".to_string(),
+                "8.8.8.8:5353".to_string(),
+                "[2001:4860:4860::8888]:53".to_string(),
+            ]),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            vec![
+                SocketAddr::new(Ipv4Addr::new(223, 5, 5, 5).into(), 53),
+                SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 5353),
+                SocketAddr::new(
+                    Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888).into(),
+                    53
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_upstreams_dedup() {
+        let result = parse_upstreams(
+            &OneOrMany(vec![
+                "8.8.8.8".to_string(),
+                "8.8.8.8:53".to_string(),
+                "1.1.1.1".to_string(),
+            ]),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            vec![
+                SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 53),
+                SocketAddr::new(Ipv4Addr::new(1, 1, 1, 1).into(), 53),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_upstreams_empty_rejected() {
+        assert!(parse_upstreams(&OneOrMany(vec![]), "test").is_err());
+    }
+
+    #[test]
+    fn test_parse_upstreams_invalid_entry_rejected() {
+        let result = parse_upstreams(
+            &OneOrMany(vec!["8.8.8.8".to_string(), "not-a-host".to_string()]),
+            "test",
+        );
+        assert!(result.is_err());
+    }
+
+    // ========== race_queries ==========
+
+    type BoxedQuery = (SocketAddr, Pin<Box<dyn Future<Output = Option<Vec<u8>>>>>);
+
+    fn addr(last: u8) -> SocketAddr {
+        SocketAddr::new(Ipv4Addr::new(127, 0, 0, last).into(), 53)
+    }
+
+    /// 与 a_query() 完全对应的合法 A 应答（ID / 问题段一致）
+    fn a_answer(ip: Ipv4Addr) -> Vec<u8> {
+        build_a_response(&a_query(), ip, 60)
+    }
+
+    /// 把包延迟 delay 后返回的竞速候选
+    fn delayed(packet: Vec<u8>, delay: Duration) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>>>> {
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Some(packet)
+        })
+    }
+
+    /// 与 a_query() 同 ID 但内容畸形的包（截断报文）
+    fn malformed_same_id() -> Vec<u8> {
+        let mut pkt = a_query().to_vec().unwrap();
+        pkt.truncate(15);
+        pkt
+    }
+
+    #[tokio::test]
+    async fn test_race_queries_empty_returns_none() {
+        let futs: Vec<(SocketAddr, std::future::Ready<Option<Vec<u8>>>)> = Vec::new();
+        assert!(
+            race_queries(&a_query().to_vec().unwrap(), futs)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_race_queries_first_success_wins_even_after_failures() {
+        let request = a_query().to_vec().unwrap();
+        let answer = a_answer(Ipv4Addr::new(1, 2, 3, 4));
+
+        let futs: Vec<BoxedQuery> = vec![
+            (addr(1), Box::pin(async { None })),
+            (addr(2), delayed(answer.clone(), Duration::from_millis(30))),
+        ];
+
+        // 先失败者不能让竞速提前结束，必须等成功者返回
+        assert_eq!(race_queries(&request, futs).await, Some(answer));
+    }
+
+    #[tokio::test]
+    async fn test_race_queries_all_fail_returns_none() {
+        let futs: Vec<BoxedQuery> = vec![
+            (addr(1), Box::pin(async { None })),
+            (addr(2), Box::pin(async { None })),
+        ];
+        assert!(
+            race_queries(&a_query().to_vec().unwrap(), futs)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_race_queries_fastest_success_wins() {
+        let request = a_query().to_vec().unwrap();
+        let fast_answer = a_answer(Ipv4Addr::new(2, 2, 2, 2));
+        let slow_answer = a_answer(Ipv4Addr::new(3, 3, 3, 3));
+
+        let futs: Vec<BoxedQuery> = vec![
+            (addr(1), delayed(slow_answer, Duration::from_secs(30))),
+            (
+                addr(2),
+                delayed(fast_answer.clone(), Duration::from_millis(5)),
+            ),
+        ];
+
+        // 慢的 30s 请求不应该拖慢整体
+        let started = Instant::now();
+        assert_eq!(race_queries(&request, futs).await, Some(fast_answer));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    // ========== 应答资格判定（软失败 / 畸形包不判胜） ==========
+
+    fn a_query() -> Message {
+        let mut msg = Message::new();
+        msg.set_id(4321);
+        msg.add_query(Query::query(
+            Name::from_ascii("example.com").unwrap(),
+            RecordType::A,
+        ));
+        msg
+    }
+
+    fn aaaa_query() -> Message {
+        let mut msg = Message::new();
+        msg.set_id(4321);
+        msg.add_query(Query::query(
+            Name::from_ascii("example.com").unwrap(),
+            RecordType::AAAA,
+        ));
+        msg
+    }
+
+    fn servfail_packet() -> Vec<u8> {
+        build_servfail_response(&a_query())
+    }
+
+    fn refused_packet() -> Vec<u8> {
+        let mut msg = a_query();
+        msg.set_message_type(MessageType::Response);
+        msg.set_response_code(ResponseCode::Refused);
+        msg.to_vec().unwrap()
+    }
+
+    fn ok_packet() -> Vec<u8> {
+        a_answer(Ipv4Addr::new(93, 184, 216, 34))
+    }
+
+    /// ID / QNAME / QTYPE 都与 a_query() 一致，但 QCLASS=CH 的"应答"
+    fn wrong_class_answer() -> Vec<u8> {
+        let mut query = Message::new();
+        query.set_id(4321);
+        let mut q = Query::query(Name::from_ascii("example.com").unwrap(), RecordType::A);
+        q.set_query_class(DNSClass::CH);
+        query.add_query(q);
+
+        build_a_response(&query, Ipv4Addr::new(1, 1, 1, 1), 60)
+    }
+
+    /// ID 对不上的 SERVFAIL
+    fn servfail_wrong_id() -> Vec<u8> {
+        let mut query = a_query();
+        query.set_id(999);
+        build_servfail_response(&query)
+    }
+
+    /// 问题段对不上的 SERVFAIL
+    fn servfail_wrong_question() -> Vec<u8> {
+        let mut query = Message::new();
+        query.set_id(4321);
+        query.add_query(Query::query(
+            Name::from_ascii("evil.example.net").unwrap(),
+            RecordType::A,
+        ));
+        build_servfail_response(&query)
+    }
+
+    #[test]
+    fn test_classify_answer_usable() {
+        let request = a_query().to_vec().unwrap();
+        assert_eq!(classify_answer(&request, &ok_packet()), RaceVerdict::Usable);
+        // NXDOMAIN 是权威正常答案，有资格胜出
+        let mut nx = a_query();
+        nx.set_message_type(MessageType::Response);
+        nx.set_response_code(ResponseCode::NXDomain);
+        assert_eq!(
+            classify_answer(&request, &nx.to_vec().unwrap()),
+            RaceVerdict::Usable
+        );
+    }
+
+    #[test]
+    fn test_classify_answer_soft_failure() {
+        let request = a_query().to_vec().unwrap();
+        assert_eq!(
+            classify_answer(&request, &servfail_packet()),
+            RaceVerdict::SoftFailure
+        );
+        assert_eq!(
+            classify_answer(&request, &refused_packet()),
+            RaceVerdict::SoftFailure
+        );
+    }
+
+    #[test]
+    fn test_classify_answer_mismatched_soft_failure_is_unusable() {
+        let request = a_query().to_vec().unwrap();
+
+        // 关联性校验先于 RCODE 分类：ID / 问题段对不上的 SERVFAIL 不是"这个上游的软失败"
+        assert_eq!(
+            classify_answer(&request, &servfail_wrong_id()),
+            RaceVerdict::Unusable
+        );
+        assert_eq!(
+            classify_answer(&request, &servfail_wrong_question()),
+            RaceVerdict::Unusable
+        );
+    }
+
+    #[test]
+    fn test_classify_answer_unusable() {
+        let request = a_query().to_vec().unwrap();
+
+        // 无法解析的包
+        assert_eq!(
+            classify_answer(&request, &[0u8, 1, 2, 3]),
+            RaceVerdict::Unusable
+        );
+        assert_eq!(classify_answer(&request, &[]), RaceVerdict::Unusable);
+
+        // 同 ID 但被截断的应答
+        assert_eq!(
+            classify_answer(&request, &malformed_same_id()),
+            RaceVerdict::Unusable
+        );
+
+        // 不是应答（把请求原样发回来）
+        assert_eq!(classify_answer(&request, &request), RaceVerdict::Unusable);
+
+        // ID 对不上
+        let mut other_id = a_query();
+        other_id.set_id(99);
+        assert_eq!(
+            classify_answer(
+                &request,
+                &build_a_response(&other_id, Ipv4Addr::new(1, 1, 1, 1), 60)
+            ),
+            RaceVerdict::Unusable
+        );
+
+        // 问题段与请求不符（答的是别的域名/别的类型）
+        let mut other_q = Message::new();
+        other_q.set_id(4321);
+        other_q.add_query(Query::query(
+            Name::from_ascii("evil.example.net").unwrap(),
+            RecordType::A,
+        ));
+        assert_eq!(
+            classify_answer(
+                &request,
+                &build_a_response(&other_q, Ipv4Addr::new(1, 1, 1, 1), 60)
+            ),
+            RaceVerdict::Unusable
+        );
+
+        let aaaa_answer = build_aaaa_response(
+            &aaaa_query(),
+            Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111),
+            60,
+        );
+        assert_eq!(
+            classify_answer(&request, &aaaa_answer),
+            RaceVerdict::Unusable
+        );
+
+        // 问题段 QCLASS 不符（QNAME/QTYPE 都一致）
+        assert_eq!(
+            classify_answer(&request, &wrong_class_answer()),
+            RaceVerdict::Unusable
+        );
+    }
+
+    #[tokio::test]
+    async fn test_race_queries_servfail_does_not_beat_later_clean_answer() {
+        let request = a_query().to_vec().unwrap();
+        let ok = ok_packet();
+
+        let futs: Vec<BoxedQuery> = vec![
+            (
+                addr(1),
+                delayed(servfail_packet(), Duration::from_millis(5)),
+            ),
+            (addr(2), delayed(ok.clone(), Duration::from_millis(50))),
+        ];
+
+        // 快速 SERVFAIL 不能杀掉稍后返回正常答案的上游
+        assert_eq!(race_queries(&request, futs).await, Some(ok));
+    }
+
+    #[tokio::test]
+    async fn test_race_queries_refused_does_not_beat_later_clean_answer() {
+        let request = a_query().to_vec().unwrap();
+        let ok = ok_packet();
+
+        let futs: Vec<BoxedQuery> = vec![
+            (addr(1), delayed(refused_packet(), Duration::from_millis(5))),
+            (addr(2), delayed(ok.clone(), Duration::from_millis(30))),
+        ];
+
+        assert_eq!(race_queries(&request, futs).await, Some(ok));
+    }
+
+    #[tokio::test]
+    async fn test_race_queries_malformed_packet_does_not_beat_later_clean_answer() {
+        let request = a_query().to_vec().unwrap();
+        let ok = ok_packet();
+
+        // 先到的同 ID 畸形包不能杀掉稍后返回正常答案的上游
+        let futs: Vec<BoxedQuery> = vec![
+            (
+                addr(1),
+                delayed(malformed_same_id(), Duration::from_millis(5)),
+            ),
+            (addr(2), delayed(ok.clone(), Duration::from_millis(50))),
+        ];
+
+        assert_eq!(race_queries(&request, futs).await, Some(ok));
+    }
+
+    #[tokio::test]
+    async fn test_race_queries_wrong_class_answer_does_not_beat_later_clean_answer() {
+        let request = a_query().to_vec().unwrap();
+        let ok = ok_packet();
+
+        // 先到的应答 QCLASS=CH，不能杀掉稍后返回正确 QCLASS 的上游
+        let futs: Vec<BoxedQuery> = vec![
+            (
+                addr(1),
+                delayed(wrong_class_answer(), Duration::from_millis(5)),
+            ),
+            (addr(2), delayed(ok.clone(), Duration::from_millis(50))),
+        ];
+
+        assert_eq!(race_queries(&request, futs).await, Some(ok));
+    }
+
+    /// drop 时计数的哨兵：用来直接断言输家 future 被 drop（而不是只看耗时）
+    struct DropFlag(Arc<AtomicUsize>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// 永不完成、但持有 DropFlag 的候选
+    async fn pending_with_flag(flag: Arc<AtomicUsize>) -> Option<Vec<u8>> {
+        let _flag = DropFlag(flag);
+        std::future::pending::<()>().await;
+        None
+    }
+
+    #[tokio::test]
+    async fn test_race_queries_drops_losing_futures() {
+        let request = a_query().to_vec().unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+
+        // 两个永不完成的候选（等价于两个悬着的上游查询）+ 一个 5ms 后正常应答的赢家
+        let futs: Vec<BoxedQuery> = vec![
+            (addr(1), Box::pin(pending_with_flag(dropped.clone()))),
+            (addr(2), Box::pin(pending_with_flag(dropped.clone()))),
+            (addr(3), delayed(ok_packet(), Duration::from_millis(5))),
+        ];
+
+        let resp = race_queries(&request, futs)
+            .await
+            .expect("must get an answer");
+
+        assert_eq!(classify_answer(&request, &resp), RaceVerdict::Usable);
+        // 竞速返回的那一刻，两个悬着的候选必须已经被 drop（abort）
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_race_queries_all_unusable_returns_fallback_packet() {
+        let request = a_query().to_vec().unwrap();
+        let malformed = malformed_same_id();
+
+        let futs: Vec<BoxedQuery> = vec![
+            (
+                addr(1),
+                delayed(malformed.clone(), Duration::from_millis(5)),
+            ),
+            (addr(2), Box::pin(async { None })),
+        ];
+
+        // 没有任何有效应答时，仍把畸形包交回客户端（保持旧的"收到即转发"行为）
+        assert_eq!(race_queries(&request, futs).await, Some(malformed));
+    }
+
+    #[tokio::test]
+    async fn test_race_queries_all_soft_failure_returns_first_soft_failure() {
+        let request = a_query().to_vec().unwrap();
+        let first = servfail_packet();
+        let second = refused_packet();
+
+        let futs: Vec<BoxedQuery> = vec![
+            (addr(1), delayed(first.clone(), Duration::from_millis(5))),
+            (addr(2), delayed(second, Duration::from_millis(10))),
+        ];
+
+        // 全部软失败时返回第一个软失败应答（保留上游原始报文，而不是合成 SERVFAIL）
+        assert_eq!(race_queries(&request, futs).await, Some(first));
+    }
+
+    #[tokio::test]
+    async fn test_race_queries_soft_failure_with_all_others_failed_returns_soft_failure() {
+        let request = a_query().to_vec().unwrap();
+        let soft = servfail_packet();
+
+        let futs: Vec<BoxedQuery> = vec![
+            (addr(1), delayed(soft.clone(), Duration::from_millis(5))),
+            (addr(2), Box::pin(async { None })),
+        ];
+
+        // 只有一个软失败、其余全部超时/报错时，仍然把软失败应答交回去
+        assert_eq!(race_queries(&request, futs).await, Some(soft));
+    }
+
+    // ========== 真实 UDP socket 的竞速 ==========
+
+    /// 启动一个真实 UDP 上游 mock：收到一次查询后按顺序回多个包（各自带延迟），
+    /// 响应 ID 跟随请求 ID。用于模拟"先污染包、后干净包"这类多包上游。
+    async fn spawn_mock_upstream_seq(responses: Vec<(Vec<u8>, Duration)>) -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                let Ok((len, peer)) = socket.recv_from(&mut buf).await else {
+                    return;
+                };
+                if len < 2 {
+                    continue;
+                }
+
+                for (response, delay) in &responses {
+                    if response.len() < 2 {
+                        continue;
+                    }
+
+                    let mut resp = response.clone();
+                    resp[0] = buf[0];
+                    resp[1] = buf[1];
+
+                    if !delay.is_zero() {
+                        tokio::time::sleep(*delay).await;
+                    }
+
+                    let _ = socket.send_to(&resp, peer).await;
+                }
+            }
+        });
+
+        addr
+    }
+
+    /// 只回一个包的 mock
+    async fn spawn_mock_upstream(response: Vec<u8>, delay: Duration) -> SocketAddr {
+        spawn_mock_upstream_seq(vec![(response, delay)]).await
+    }
+
+    fn make_race_fut(request: Vec<u8>, upstream: SocketAddr, timeout: Duration) -> BoxedQuery {
+        (
+            upstream,
+            Box::pin(async move { query_upstream_once(&request, &upstream, timeout).await.ok() }),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_race_real_udp_clean_answer_beats_fast_servfail_and_aborts_loser() {
+        let request = a_query().to_vec().unwrap();
+        let timeout = Duration::from_secs(2);
+
+        // 上游1：立刻回 SERVFAIL
+        let fast_servfail = spawn_mock_upstream(servfail_packet(), Duration::ZERO).await;
+        // 上游2：60ms 后回正常答案
+        let slow_clean = spawn_mock_upstream(ok_packet(), Duration::from_millis(60)).await;
+        // 上游3：黑洞，30s 后才回
+        let black_hole = spawn_mock_upstream(ok_packet(), Duration::from_secs(30)).await;
+
+        let futs = vec![
+            make_race_fut(request.clone(), fast_servfail, timeout),
+            make_race_fut(request.clone(), slow_clean, timeout),
+            make_race_fut(request.clone(), black_hole, timeout),
+        ];
+
+        let started = Instant::now();
+        let resp = race_queries(&request, futs)
+            .await
+            .expect("must get an answer");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            Message::from_vec(&resp).unwrap().response_code(),
+            ResponseCode::NoError
+        );
+        // 黑洞上游被 abort，不能被它的 30s 拖住
+        assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn test_race_real_udp_all_soft_failure_returns_soft_failure() {
+        let request = a_query().to_vec().unwrap();
+        let timeout = Duration::from_secs(2);
+
+        let servfail = spawn_mock_upstream(servfail_packet(), Duration::ZERO).await;
+        let refused = spawn_mock_upstream(refused_packet(), Duration::from_millis(20)).await;
+
+        let futs = vec![
+            make_race_fut(request.clone(), servfail, timeout),
+            make_race_fut(request.clone(), refused, timeout),
+        ];
+
+        let resp = race_queries(&request, futs)
+            .await
+            .expect("soft failure still yields a packet");
+
+        assert_eq!(classify_answer(&request, &resp), RaceVerdict::SoftFailure);
+    }
+
+    #[tokio::test]
+    async fn test_race_real_udp_malformed_packet_does_not_beat_later_clean_answer() {
+        let request = a_query().to_vec().unwrap();
+        let timeout = Duration::from_secs(2);
+
+        // 上游1：立刻回同 ID 的畸形包；上游2：60ms 后回正常答案
+        let fast_malformed = spawn_mock_upstream(malformed_same_id(), Duration::ZERO).await;
+        let slow_clean = spawn_mock_upstream(ok_packet(), Duration::from_millis(60)).await;
+
+        let futs = vec![
+            make_race_fut(request.clone(), fast_malformed, timeout),
+            make_race_fut(request.clone(), slow_clean, timeout),
+        ];
+
+        let resp = race_queries(&request, futs)
+            .await
+            .expect("must get an answer");
+
+        assert_eq!(classify_answer(&request, &resp), RaceVerdict::Usable);
+        assert_eq!(resp, ok_packet());
+    }
+
+    /// 国外路径的污染过滤循环必须与竞速协同：
+    /// 一个上游先发污染包、后发干净包，另一个上游直接回干净包
+    #[tokio::test]
+    async fn test_foreign_query_filtered_races_with_pollution_checking() {
+        let request = aaaa_query().to_vec().unwrap();
+        let timeout = Duration::from_secs(2);
+
+        let checker = std::sync::Arc::new(PollutionChecker {
+            v4: HashSet::new(),
+            v6: HashSet::new(),
+            max_packets: 5,
+        });
+
+        // GFW 特征污染包：2001::/16 且中间 10 字节全零
+        let polluted = build_aaaa_response(
+            &aaaa_query(),
+            Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 1),
+            60,
+        );
+        assert_eq!(checker.check(&polluted), PollutionResult::Polluted);
+
+        // 上游1：先污染包，40ms 后再回干净包
+        let clean_a = build_aaaa_response(
+            &aaaa_query(),
+            Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111),
+            60,
+        );
+        let upstream_a = spawn_mock_upstream_seq(vec![
+            (polluted, Duration::ZERO),
+            (clean_a, Duration::from_millis(40)),
+        ])
+        .await;
+
+        // 上游2：10ms 后回另一个干净包，应该由它胜出
+        let clean_b = build_aaaa_response(
+            &aaaa_query(),
+            Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x2222),
+            60,
+        );
+        let upstream_b = spawn_mock_upstream(clean_b.clone(), Duration::from_millis(10)).await;
+
+        async fn probe(
+            request: Vec<u8>,
+            upstream: SocketAddr,
+            checker: std::sync::Arc<PollutionChecker>,
+            timeout: Duration,
+        ) -> Option<Vec<u8>> {
+            foreign_query_filtered(&request, &upstream, timeout, "example.com", &checker).await
+        }
+
+        let futs = vec![
+            (
+                upstream_a,
+                probe(request.clone(), upstream_a, checker.clone(), timeout),
+            ),
+            (
+                upstream_b,
+                probe(request.clone(), upstream_b, checker.clone(), timeout),
+            ),
+        ];
+
+        let resp = race_queries(&request, futs)
+            .await
+            .expect("must get an answer");
+
+        // 污染包既不能判胜，也不能成为兜底结果；胜者是更快的干净应答
+        assert_eq!(resp, clean_b);
+        assert_eq!(classify_answer(&request, &resp), RaceVerdict::Usable);
+    }
+
+    #[tokio::test]
+    async fn test_race_real_udp_all_timeout_returns_none() {
+        let request = a_query().to_vec().unwrap();
+        let timeout = Duration::from_millis(150);
+
+        let black_hole = spawn_mock_upstream(ok_packet(), Duration::from_secs(30)).await;
+        let futs = vec![make_race_fut(request.clone(), black_hole, timeout)];
+
+        let started = Instant::now();
+        assert!(race_queries(&request, futs).await.is_none());
+        assert!(started.elapsed() >= Duration::from_millis(120));
     }
 }

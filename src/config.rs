@@ -14,6 +14,13 @@ use std::fmt;
 /// "multi.example.com" = ["1.2.3.4", "5.6.7.8"]
 /// localhost           = "127.0.0.1"  # 无点号可不加引号
 /// ```
+///
+/// 上游 DNS 同样支持单点或列表写法（列表表示并发竞速，先应答者胜出）：
+///
+/// ```toml
+/// domestic_upstream = "223.5.5.5"
+/// foreign_upstream  = ["8.8.8.8", "1.1.1.1"]
+/// ```
 #[derive(Clone, Debug, Serialize)]
 pub struct OneOrMany(pub Vec<String>);
 
@@ -64,9 +71,9 @@ pub struct Config {
     #[serde(default)]
     pub special_suffixes: Option<Vec<String>>,
     #[serde(default)]
-    pub special_upstream: Option<String>,
-    pub domestic_upstream: String,
-    pub foreign_upstream: String,
+    pub special_upstream: Option<OneOrMany>,
+    pub domestic_upstream: OneOrMany,
+    pub foreign_upstream: OneOrMany,
     pub mmdb_path: String,
     pub cache_size: usize,
     #[serde(default = "default_query_timeout_sec")]
@@ -115,7 +122,7 @@ pub struct Config {
     #[serde(default)]
     pub trust_domestic_nodata_reply: bool,
 
-    /// 最大并发请求数, 防止tproxy成环用, 默认 128
+    /// 最大并发请求数, 防止tproxy成环用, 默认 1024
     #[serde(default = "default_max_in_flight")]
     pub max_in_flight: usize,
 }
@@ -137,7 +144,7 @@ fn default_max_polluted_packets() -> usize {
 }
 
 fn default_max_in_flight() -> usize {
-    128
+    1024
 }
 
 fn default_query_timeout_sec() -> u64 {
@@ -148,6 +155,20 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.max_in_flight == 0 {
             bail!("max_in_flight must be > 0");
+        }
+
+        if self.domestic_upstream.0.is_empty() {
+            bail!("domestic_upstream cannot be empty");
+        }
+
+        if self.foreign_upstream.0.is_empty() {
+            bail!("foreign_upstream cannot be empty");
+        }
+
+        if let Some(special) = &self.special_upstream
+            && special.0.is_empty()
+        {
+            bail!("special_upstream cannot be empty");
         }
 
         if self.query_timeout_sec == 0 {
@@ -222,8 +243,8 @@ mod tests {
             listen: "0.0.0.0:53".to_string(),
             special_suffixes: None,
             special_upstream: None,
-            domestic_upstream: "127.0.0.1:53".to_string(),
-            foreign_upstream: "127.0.0.1:53".to_string(),
+            domestic_upstream: OneOrMany(vec!["127.0.0.1:53".to_string()]),
+            foreign_upstream: OneOrMany(vec!["127.0.0.1:53".to_string()]),
             mmdb_path: "/dev/null".to_string(),
             cache_size: 100,
             query_timeout_sec: 5,
@@ -242,7 +263,7 @@ mod tests {
             ipv6_list: default_ipv6_list_path(),
             max_polluted_packets: default_max_polluted_packets(),
             trust_domestic_nodata_reply: false,
-            max_in_flight: 128,
+            max_in_flight: default_max_in_flight(),
         }
     }
 
@@ -409,6 +430,63 @@ mod tests {
     }
 
     // ========== TOML 反序列化 ==========
+
+    #[test]
+    fn test_toml_upstream_single_string_compat() {
+        let toml_str = r#"
+            listen = "0.0.0.0:53"
+            domestic_upstream = "223.5.5.5"
+            foreign_upstream = "8.8.8.8:5353"
+            mmdb_path = "/dev/null"
+            cache_size = 100
+            enable_ipv6_aaaa = true
+            domestic_countries = ["CN"]
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.domestic_upstream.0, vec!["223.5.5.5".to_string()]);
+        assert_eq!(cfg.foreign_upstream.0, vec!["8.8.8.8:5353".to_string()]);
+        assert!(cfg.special_upstream.is_none());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_toml_upstream_array() {
+        let toml_str = r#"
+            listen = "0.0.0.0:53"
+            domestic_upstream = "223.5.5.5"
+            foreign_upstream = ["8.8.8.8", "1.1.1.1"]
+            special_upstream = ["127.0.0.1:5354", "127.0.0.1:5355"]
+            mmdb_path = "/dev/null"
+            cache_size = 100
+            enable_ipv6_aaaa = true
+            domestic_countries = ["CN"]
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.foreign_upstream.0,
+            vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
+        );
+        assert_eq!(
+            cfg.special_upstream.as_ref().unwrap().0,
+            vec!["127.0.0.1:5354".to_string(), "127.0.0.1:5355".to_string()]
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_upstream_empty_list_rejected() {
+        let mut cfg = valid_config();
+        cfg.foreign_upstream = OneOrMany(vec![]);
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = valid_config();
+        cfg.domestic_upstream = OneOrMany(vec![]);
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = valid_config();
+        cfg.special_upstream = Some(OneOrMany(vec![]));
+        assert!(cfg.validate().is_err());
+    }
 
     #[test]
     fn test_toml_hosts_single_string() {

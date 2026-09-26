@@ -66,13 +66,34 @@ echo '0 3 * * 0 /usr/libexec/update_tsubamegaeshi_files.sh' >> /etc/crontabs/roo
 新建 `config.toml`，只填必填项即可跑起来：
 
 ```toml
-listen              = "0.0.0.0:5353"
-domestic_upstream   = "223.5.5.5"
-foreign_upstream    = "8.8.8.8"
-mmdb_path           = "/etc/tsubamegaeshi-rs/GeoLite2-Country.mmdb"
-cache_size          = 4096
-enable_ipv6_aaaa    = false
+listen            = "0.0.0.0:5353"
+
+# 国内：阿里云 + 腾讯 DNSPod，各带 v4/v6
+domestic_upstream = [
+  "223.5.5.5",
+  "119.29.29.29",
+  "2400:3200::1",
+  "2402:4e00::",
+]
+
+# 国际：Cloudflare + Google，各带 v4/v6
+foreign_upstream = [
+  "1.0.0.1",
+  "8.8.8.8",
+  "8.8.4.4",
+  "1.1.1.1",
+  "2606:4700:4700::1111",
+  "2606:4700:4700::1001",
+  "2001:4860:4860::8888",
+  "2001:4860:4860::8844",
+]
+
+mmdb_path         = "/etc/tsubamegaeshi-rs/GeoLite2-Country.mmdb"
+cache_size        = 4096
+enable_ipv6_aaaa  = false
 ```
+
+上例就是 `contrib/` 里随包发货的默认组合：国内固定在两家服务商上（阿里云 + 腾讯 DNSPod），国际用 Cloudflare + Google，两家都同时给出 IPv4 与 IPv6 地址——有些线路 IPv6 比 IPv4 快；没有 v6 出口的机器上 v6 上游会直接失败，不影响组内 v4 上游胜出。组内竞速意味着不需要替所有人挑一个"最快"的——哪家线路快就用哪家，`contrib/` 的 init 脚本也以同样的默认值生成配置。
 
 ### 3️⃣ 校验配置
 
@@ -100,8 +121,8 @@ flowchart LR
     CL["客户端<br/>（DHCP 默认 DNS = 路由器 :53）"] --> DM["dnsmasq :53<br/>本地域名 · DHCP"]
     DM -->|"上游"| TS["燕返 :5353"]
     TS -->|".lan / .home 等本地后缀"| DM
-    TS -->|"国内域名"| CN["国内上游 223.5.5.5"]
-    TS -->|"其他 / 被墙域名"| FW["国外上游 8.8.8.8（污染检测）"]
+    TS -->|"国内域名"| CN["国内上游<br/>阿里云 + 腾讯"]
+    TS -->|"其他 / 被墙域名"| FW["国外上游<br/>Cloudflare + Google<br/>（污染检测 + 竞速）"]
 ```
 
 ```bash
@@ -340,9 +361,13 @@ GFW 的 DNS 污染采用**抢答**（inject）策略——在真实响应到达�
 
 ### 并发与超时
 
-- `max_in_flight` 限制同时处理的请求数（默认 128），防止 tproxy 成环时 CPU 打满；超出限制的请求直接丢弃
+- `max_in_flight` 限制同时处理的请求数（默认 1024），防止 tproxy 成环时 CPU 打满；超出限制的请求直接丢弃
 - 单次上游查询在 `query_timeout_sec` 预算内进行，快速失败会自动重试（间隔至多 2 秒）；每个请求另有 3 倍超时的硬上限
 - 所有上游查询使用独立的临时 UDP socket，地址族跟随上游地址（IPv4 / IPv6 上游均可）
+- 上游可以配多个（TOML 数组），此时并发向全部上游查询，**先返回有效应答的胜出，其余查询立即中止**（临时 socket 随之关闭）；单个上游仍可写成裸字符串，行为与旧版本一致
+- 竞速下每个 in-flight 请求最多占用「上游个数」个临时 socket，fd 用量约为 `max_in_flight × 上游个数`（默认 1024 × 上游数），已超过 procd 默认的 `nofile=1024`；OpenWrt init 脚本因此固定了 `procd_set_param limits nofile="1048576 1048576"`
+- 竞速只认可**有效应答**：报文必须能完整解析、确为应答，且 ID 与问题段（QNAME / QTYPE / QCLASS）都与请求一致；`SERVFAIL` / `REFUSED`（该上游自身有问题）和畸形包（链路有问题）都**不判胜**，会继续等其它上游
+- 若所有上游都没给出有效应答，把最先到达的那个软失败/畸形报文原样交回客户端（保留上游真实 RCODE，而不是合成 `SERVFAIL`）；一个候选都没有（全部超时/报错）才合成 `SERVFAIL`
 
 ---
 
@@ -354,14 +379,14 @@ GFW 的 DNS 污染采用**抢答**（inject）策略——在真实响应到达�
 |---|:---:|---|---|
 | `listen` | ✅ | — | 监听地址；使用 IPv6 地址时自动双栈 |
 | `special_suffixes` | ➖ | — | 转发到 special 上游的域名后缀（可为 `[]`）；不配置则关闭 special 分流 |
-| `special_upstream` | ➖ | — | special 上游。支持 `ip`、`ip:port`、`[v6]:port`、裸 IPv6，省略端口默认 53 |
-| `domestic_upstream` | ✅ | — | 国内上游（语法同上） |
-| `foreign_upstream` | ✅ | — | 国外上游（语法同上） |
+| `special_upstream` | ➖ | — | special 上游，单个字符串或数组。支持 `ip`、`ip:port`、`[v6]:port`、裸 IPv6，省略端口默认 53 |
+| `domestic_upstream` | ✅ | — | 国内上游（语法同上，数组表示组内并发竞速）。随包默认 `223.5.5.5` + `119.29.29.29` + `2400:3200::1` + `2402:4e00::` |
+| `foreign_upstream` | ✅ | — | 国外上游（语法同上，数组表示组内并发竞速）。随包默认 `1.0.0.1` + `8.8.8.8` + `8.8.4.4` + `1.1.1.1` + 对应的 4 个 IPv6 地址 |
 | `mmdb_path` | ✅ | — | MaxMind GeoLite2 国家库路径，启动时加载，缺失/损坏直接退出 |
 | `cache_size` | ✅ | — | 缓存条目数；`0` 关闭缓存 |
 | `enable_ipv6_aaaa` | ✅ | — | `false` 时 AAAA 查询直接返回 NODATA |
 | `query_timeout_sec` | ➖ | `10` | 单次上游查询超时（秒），必须 > 0 |
-| `max_in_flight` | ➖ | `128` | 最大并发请求数，超限丢弃，必须 > 0 |
+| `max_in_flight` | ➖ | `1024` | 最大并发请求数，超限丢弃，必须 > 0 |
 | `log_level` | ➖ | `info,tsubamegaeshi_rs=debug` | EnvFilter 语法；maxminddb 恒压到 warn |
 | `gfwlist_path` | ➖ | — | Base64 编码 GFWList；不配置则关闭该功能 |
 | `gfbloom_fp_rate` | ➖ | `0.001` | 布隆误判率，(0, 1) 开区间 |
@@ -387,8 +412,25 @@ listen = "0.0.0.0:5353"               # 【必填】监听地址，也支持 "[:
 
 # ---------- 上游服务器 ----------
 # 支持 "ip"、"ip:port"、"[v6]:port"、裸 IPv6 四种写法，省略端口时默认 53
-domestic_upstream  = "223.5.5.5"        # 【必填】
-foreign_upstream   = "8.8.8.8"          # 【必填】
+# 单个可以写成 "223.5.5.5"，多个写成数组：组内并发查询，先返回合格答案的胜出，其余中止
+# 【必填】国内组：阿里云 + 腾讯 DNSPod，各带 v4/v6
+domestic_upstream  = [
+  "223.5.5.5",
+  "119.29.29.29",
+  "2400:3200::1",
+  "2402:4e00::",
+]
+# 【必填】国际组：Cloudflare + Google，各带 v4/v6
+foreign_upstream   = [
+  "1.0.0.1",
+  "8.8.8.8",
+  "8.8.4.4",
+  "1.1.1.1",
+  "2606:4700:4700::1111",
+  "2606:4700:4700::1001",
+  "2001:4860:4860::8888",
+  "2001:4860:4860::8844",
+]
 # special_upstream = "127.0.0.1:5354"   # 通常指向本地 dnsmasq
 
 # ---------- Special 后缀 ----------【可选】
@@ -409,7 +451,7 @@ enable_ipv6_aaaa = false              # 设为 true 启用 AAAA 查询
 
 # ---------- 超时与并发 ----------
 # query_timeout_sec = 10              # 单次上游查询超时（秒），默认 10，必须 > 0
-# max_in_flight = 128                 # 最大并发请求数，默认 128，必须 > 0
+# max_in_flight = 1024                # 最大并发请求数，默认 1024，必须 > 0
 
 # ---------- 日志 ----------
 # 支持 tracing-subscriber 的 EnvFilter 语法；
@@ -463,7 +505,7 @@ social = ["facebook.com", "instagram.com", "tiktok.com"]
 ads    = ["doubleclick.net", "googlesyndication.com"]
 ```
 
-启动时会做配置校验，不合法直接报错退出，包括：`max_in_flight` / `query_timeout_sec` 为 0、布隆误判率不在 (0, 1) 开区间、marksite 分组名含非法字符、hosts 条目为空或规范化后重复。可以用 `-T` 在不启动服务的情况下预检。
+启动时会做配置校验，不合法直接报错退出，包括：`max_in_flight` / `query_timeout_sec` 为 0、上游列表为空、布隆误判率不在 (0, 1) 开区间、marksite 分组名含非法字符、hosts 条目为空或规范化后重复。可以用 `-T` 在不启动服务的情况下预检。
 
 ### 规则文件格式
 

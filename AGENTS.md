@@ -40,7 +40,7 @@ OpenWrt MIPS 目标交叉编译使用 `cross`（见 `Cross.toml`），日常开�
 | `task_guard.rs` | 任务生命周期管理，CancellationToken，带超时的优雅关闭 |
 | `config.rs` | TOML 配置结构体，校验规则 |
 
-### 请求流程（server.rs:846 `handle_request`）
+### 请求流程（server.rs:997 `handle_request`）
 
 1. 解析 DNS 报文，提取查询类型（A/AAAA/HTTPS/其他）
 2. AAAA 被禁用？→ NODATA
@@ -48,7 +48,7 @@ OpenWrt MIPS 目标交叉编译使用 `cross`（见 `Cross.toml`），日常开�
 4. AdBlock 命中？→ 0.0.0.0 / :: / NODATA
 5. 缓存命中？→ 返回缓存结果（ID 重写）
 6. 静态规则：special_suffixes → force_domestic → force_foreign → GFWList 布隆
-7. 默认路径：查国内上游 → 检查结果（污染/GeoIP）→ 回退到国外上游（带污染检测）
+7. 默认路径：并发查国内上游（竞速，软失败不判胜）→ 检查结果（污染/GeoIP）→ 回退到国外上游（同样竞速 + 带污染检测）
 
 ## 关键注意事项
 
@@ -57,9 +57,15 @@ OpenWrt MIPS 目标交叉编译使用 `cross`（见 `Cross.toml`），日常开�
 - **nft 二进制路径硬编码**为 `/usr/sbin/nft`（`mark_sites.rs:45,64`）。
 - **`pollution.rs:65` 的 `FB_COMBOS` 数组必须保持有序**——使用 `binary_search` 查找。添加新的 Facebook 污染前缀时，按升序插入。
 - **缓存 key** 为 `(domain: String, qtype: u16)` — domain 必须已经规范化（小写、无尾部点号）。
-- **`foreign_query`**（server.rs:86）每次查询使用独立的临时 UDP socket（不是共享监听 socket），以支持多接收污染过滤循环。
-- **`in_flight` 计数器**（server.rs:827）使用 relaxed 原子序 + RAII guard 递减——防止 tproxy 成环时打满服务器。
-- **IPv6 双栈绑定**（server.rs:1126）使用 `socket2` 的 `set_only_v6(false)` 在同一 socket 上同时接受 v4 和 v6。
+- **`foreign_query`** 每次查询使用独立的临时 UDP socket（不是共享监听 socket），以支持多接收污染过滤循环。
+- **上游是列表**：`special_upstream` / `domestic_upstream` / `foreign_upstream` 用 `OneOrMany`（字符串或数组），`main.rs` 经 `parse_upstreams()` 归一化为非空 `Vec<SocketAddr>`。多个上游时由 `race_queries()` 并发竞速：先返回有效应答的胜出，其余 future 直接 drop（abort，临时 socket 关闭）。
+- **判胜条件是"有效应答"**（`classify_answer()` → `RaceVerdict`）：报文必须能完整解析、`MessageType::Response`、ID 与问题段（qtype + query_class + 小写化后的 name）都与请求一致，才算 `Usable`；`ServFail` / `Refused` → `SoftFailure`；其余 → `Unusable`。
+- **`classify_answer()` 的判定顺序是"关联性 → RCODE"**：ID / 问题段校验必须排在 RCODE 分类之前，否则一个 ID 或问题段对不上的 SERVFAIL 会被误标为 `SoftFailure`（两者都不判胜，但三态语义和测试预期会不一致）。
+- **fallback 语义**：没有任何 `Usable` 应答时返回最先到达的 fallback 报文（保留上游原始 RCODE，而非合成 SERVFAIL）；一个 fallback 都没有（全部超时/socket 错误）才返回 `None`，由调用方合成 SERVFAIL。所以 `race_queries` 必须拿到原始 request 才能判胜。
+- **`foreign_query_filtered()`**（server.rs，自由函数）是国外上游的多包接收 + 污染过滤循环，`foreign_query_inner()` 只做"污染检查是否开启"的分支；抽成自由函数是为了能在测试里与竞速组合（`test_foreign_query_filtered_races_with_pollution_checking`）。
+- **`query_upstream_once()`**（server.rs，自由函数）是单次「发一次收一次」的查询，`send_dns_query()` 的重试循环与竞速路径共用；它拿 `timeout` 参数而不是 `self.timeout`，因此可以在测试里直接对真实 UDP mock 上游使用。
+- **`in_flight` 计数器**（server.rs:77 字段，读取在 `run()`）使用 relaxed 原子序 + RAII guard 递减——防止 tproxy 成环时打满服务器。
+- **IPv6 双栈绑定**（server.rs:1309）使用 `socket2` 的 `set_only_v6(false)` 在同一 socket 上同时接受 v4 和 v6。
 
 ## 配置
 

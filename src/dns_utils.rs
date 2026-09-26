@@ -238,7 +238,7 @@ pub fn debug_print_first_ip(
     resp: &[u8],
     tag: &str,
     domain: &str,
-    upstream: &std::net::SocketAddr,
+    upstreams: &[std::net::SocketAddr],
     precomputed_ips: Option<&[std::net::IpAddr]>,
 ) {
     if !tracing::enabled!(tracing::Level::DEBUG) {
@@ -253,15 +253,27 @@ pub fn debug_print_first_ip(
             &ips
         }
     };
+
+    let upstreams = format_upstreams(upstreams);
+
     if let Some(ip) = ip_list.first() {
-        debug!("[{}] {} -> {} = {}", tag, domain, upstream, ip);
+        debug!("[{}] {} -> {} = {}", tag, domain, upstreams, ip);
         return;
     }
 
     debug!(
         "[{}] {} -> {} (no A/AAAA/HTTPS answer)",
-        tag, domain, upstream
+        tag, domain, upstreams
     );
+}
+
+/// 上游列表的日志表示，多个时用逗号分隔
+pub fn format_upstreams(upstreams: &[std::net::SocketAddr]) -> String {
+    upstreams
+        .iter()
+        .map(|u| u.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]

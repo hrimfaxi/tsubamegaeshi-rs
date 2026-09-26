@@ -5,8 +5,10 @@ config tsubamegaeshi-rs 'config'
 	option log_level 'info'
 
 	# DNS upstream servers
-	option domestic_dns '223.5.5.5'
-	option foreign_dns '8.8.8.8'
+	# 多个地址用逗号分隔：组内并发查询，先返回合格答案的胜出，其余中止
+	# 默认国内 阿里云 + 腾讯 DNSPod，国际 Cloudflare + Google，两家各带 v4/v6
+	option domestic_dns '223.5.5.5,119.29.29.29,2400:3200::1,2402:4e00::'
+	option foreign_dns '1.0.0.1,8.8.8.8,8.8.4.4,1.1.1.1,2606:4700:4700::1111,2606:4700:4700::1001,2001:4860:4860::8888,2001:4860:4860::8844'
 	option query_timeout_sec '10'
 
 	# Special suffix
@@ -40,7 +42,9 @@ config tsubamegaeshi-rs 'config'
 	# Advanced
 	option redirect '1'
 	option disable_ipv6 '0'
-	option max_in_flight '128'
+	option max_in_flight '1024'
+	# 注：init 脚本已固定 procd limits nofile="1048576 1048576"，
+	# 竞速下 fd 用量约为 max_in_flight × 上游个数
 
 
 
